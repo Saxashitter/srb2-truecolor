@@ -122,6 +122,7 @@ extern consvar_t cv_shadow;
 extern consvar_t cv_translucency;
 extern consvar_t cv_drawdist, cv_drawdist_nights, cv_drawdist_precip;
 extern consvar_t cv_fov, cv_fovchange;
+extern consvar_t cv_trueperspective;
 extern consvar_t cv_skybox;
 extern consvar_t cv_renderview;
 extern consvar_t cv_renderhitbox, cv_renderhitboxinterpolation, cv_renderhitboxgldepth;
@@ -137,6 +138,7 @@ void R_Init(void);
 
 void R_CheckViewMorph(void);
 void R_ApplyViewMorph(void);
+fixed_t R_GetAimingShear(void);
 
 // just sets setsizeneeded true
 extern boolean setsizeneeded;

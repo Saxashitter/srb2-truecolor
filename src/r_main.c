@@ -162,6 +162,9 @@ consvar_t cv_drawdist = CVAR_INIT ("drawdist", "Infinite", CV_SAVE, drawdist_con
 consvar_t cv_drawdist_nights = CVAR_INIT ("drawdist_nights", "2048", CV_SAVE, drawdist_cons_t, NULL);
 consvar_t cv_drawdist_precip = CVAR_INIT ("drawdist_precip", "1024", CV_SAVE, drawdist_precip_cons_t, NULL);
 consvar_t cv_fov = CVAR_INIT ("fov", "90", CV_SAVE|CV_FLOAT|CV_CALL, fov_cons_t, Fov_OnChange);
+
+// Software renderer only: look up and down with real perspective, instead of shearing the view
+consvar_t cv_trueperspective = CVAR_INIT ("trueperspective", "Off", CV_SAVE, CV_OnOff, NULL);
 consvar_t cv_fovchange = CVAR_INIT ("fovchange", "Off", CV_SAVE, CV_OnOff, NULL);
 consvar_t cv_maxportals = CVAR_INIT ("maxportals", "2", CV_SAVE, maxportals_cons_t, NULL);
 
@@ -591,6 +594,37 @@ static struct {
 	false
 };
 
+// True perspective for looking up and down.
+// All the renderer can do is shear the view, which is looking straight ahead and
+// sliding the picture up or down. What a tilted camera would see is that same
+// picture seen at an angle: every row of it is one row of the sheared view, scaled
+// horizontally. So the view is rendered sheared and wider, then warped.
+//
+// Rows that look further up or down need a much wider sheared view than the rest,
+// and one that wide leaves little detail for the others. So the screen is split
+// into bands of rows, and the view is rendered once for each, as wide as it needs.
+#define TRUEPERSPECTIVE_MAXBANDS 4
+
+static struct {
+	boolean use;
+	fixed_t zoom;       // how much wider the sheared view has to be
+	fixed_t basefovtan; // fovtan without the zoom
+	fixed_t fov;        // last field of view given to R_SetFov
+	float sine, cosine; // of the angle the camera is tilted by
+	float horizon;      // the row of the sheared view that is level with the camera
+	INT32 cliptop, clipbottom; // the rows of the sheared view that the band is warped from
+
+	INT32 band, numbands;
+	INT32 bandrow[TRUEPERSPECTIVE_MAXBANDS + 1]; // first screen row of each band
+} trueperspective = {false, FRACUNIT, FRACUNIT, 0, 0.0f, 1.0f, 0.0f, 0, 0, 0, 1, {0}};
+
+// The sheared view can't reach straight up or down however wide it gets.
+// This is as wide as it goes, which is what limits how far the camera can tilt.
+#define TRUEPERSPECTIVE_MAXZOOM 8.0f
+
+// How much more one edge of a band may be scaled down than the other
+#define TRUEPERSPECTIVE_BANDRATIO 1.6f
+
 void R_CheckViewMorph(void)
 {
 	float zoomfactor, rollcos, rollsin;
@@ -813,6 +847,59 @@ void R_CheckViewMorph(void)
 	viewmorph.use = true;
 }
 
+// Warps the rows of the band that was just rendered into screens[4].
+static void R_ApplyTruePerspective(void)
+{
+	UINT8 *tmpscr = screens[4];
+	UINT8 *srcscr = screens[0];
+	const float focal = (viewwidth / 2.0f) / FIXED_TO_FLOAT(trueperspective.basefovtan);
+	const float srcfocal = FIXED_TO_FLOAT(projection);
+	const float halfwidth = viewwidth / 2.0f;
+	INT32 x, y;
+
+	for (y = trueperspective.bandrow[trueperspective.band]; y < trueperspective.bandrow[trueperspective.band + 1]; y++)
+	{
+		// Where this row of the tilted camera's screen is in the sheared view
+		const float row = (y + 0.5f) - (viewheight / 2.0f);
+		const float depth = (focal * trueperspective.cosine) + (row * trueperspective.sine);
+		const float level = ((focal * trueperspective.sine) - (row * trueperspective.cosine)) / depth;
+		const float scale = min(srcfocal / depth, 1.0f);
+		const float srcrow = trueperspective.horizon - (srcfocal * level);
+		const fixed_t xstep = (fixed_t)(scale * FRACUNIT);
+		fixed_t xfrac = (fixed_t)((halfwidth - ((halfwidth - 0.5f) * scale)) * FRACUNIT);
+
+		if (vid.bpp == 4)
+		{
+			// Enough colors to smooth it out
+			const float filterrow = max(min(srcrow - 0.5f, (float)(viewheight - 1)), 0.0f);
+			const INT32 srcy = min((INT32)filterrow, viewheight - 2);
+			const UINT32 yweight = (UINT32)((filterrow - srcy) * 256.0f);
+			const UINT32 *src1 = (const UINT32 *)(const void *)srcscr + (srcy * vid.width);
+			const UINT32 *src2 = src1 + vid.width;
+			UINT32 *dest = (UINT32 *)(void *)tmpscr + (y * vid.width);
+
+			xfrac = max(xfrac - (FRACUNIT/2), 0);
+
+			for (x = 0; x < viewwidth; x++, xfrac += xstep)
+			{
+				const INT32 x1 = min(xfrac >> FRACBITS, viewwidth - 1);
+				const INT32 x2 = min(x1 + 1, viewwidth - 1);
+				const UINT32 xweight = (xfrac >> (FRACBITS - 8)) & 0xFF;
+				dest[x] = TC_Mix(TC_Mix(src2[x2], src2[x1], xweight), TC_Mix(src1[x2], src1[x1], xweight), yweight);
+			}
+		}
+		else
+		{
+			const INT32 srcy = max(min((INT32)srcrow, viewheight - 1), 0);
+			const UINT8 *src = srcscr + (srcy * vid.width);
+			UINT8 *dest = tmpscr + (y * vid.width);
+
+			for (x = 0; x < viewwidth; x++, xfrac += xstep)
+				dest[x] = src[min(xfrac >> FRACBITS, viewwidth - 1)];
+		}
+	}
+}
+
 // Writes a pixel for the view morph debug grid.
 #define VIEWMORPH_PUT(pos, color) \
 	do { \
@@ -969,7 +1056,9 @@ fixed_t R_GetPlayerFov(player_t *player)
 static void R_SetFov(fixed_t playerfov)
 {
 	angle_t fov = FixedAngle(playerfov/2) + ANGLE_90;
-	fovtan = FixedMul(FINETANGENT(fov >> ANGLETOFINESHIFT), viewmorph.zoomneeded);
+	trueperspective.fov = playerfov;
+	trueperspective.basefovtan = FixedMul(FINETANGENT(fov >> ANGLETOFINESHIFT), viewmorph.zoomneeded);
+	fovtan = FixedMul(trueperspective.basefovtan, trueperspective.zoom);
 	if (splitscreen == 1) // Splitscreen FOV should be adjusted to maintain expected vertical view
 		fovtan = 17*fovtan/10;
 
@@ -988,6 +1077,115 @@ static void R_SetFov(fixed_t playerfov)
 
 	// setup sky scaling
 	R_SetSkyScale();
+}
+
+// How far above the horizon a row of the tilted camera's screen looks, as a slope.
+// row is from the middle of the screen. Also gives how far away that row's part of
+// the tilted screen is from the camera, going straight ahead.
+static float R_GetTruePerspectiveSlope(float row, float focal, float *depth)
+{
+	*depth = (focal * trueperspective.cosine) + (row * trueperspective.sine);
+	return ((focal * trueperspective.sine) - (row * trueperspective.cosine)) / *depth;
+}
+
+// Splits the screen into bands for the angle the camera is tilted by.
+static void R_SetTruePerspectiveBands(float focal)
+{
+	const float halfheight = viewheight / 2.0f;
+	const float topdepth = (focal * trueperspective.cosine) - (halfheight * trueperspective.sine);
+	const float bottomdepth = (focal * trueperspective.cosine) + (halfheight * trueperspective.sine);
+	const float ratio = max(topdepth, bottomdepth) / min(topdepth, bottomdepth);
+	const float wanted = ceilf(logf(ratio) / logf(TRUEPERSPECTIVE_BANDRATIO));
+	INT32 num = (INT32)wanted;
+	INT32 i;
+
+	num = max(min(num, TRUEPERSPECTIVE_MAXBANDS), 1);
+
+	for (; num > 1; num--)
+	{
+		boolean toosmall = false;
+
+		// Each band covers the same share of the scaling.
+		for (i = 1; i < num; i++)
+		{
+			const float depth = topdepth * powf(bottomdepth / topdepth, (float)i / num);
+			trueperspective.bandrow[i] = (INT32)(((depth - (focal * trueperspective.cosine)) / trueperspective.sine) + halfheight);
+		}
+
+		trueperspective.bandrow[0] = 0;
+		trueperspective.bandrow[num] = viewheight;
+
+		for (i = 0; i < num; i++)
+			if (trueperspective.bandrow[i + 1] - trueperspective.bandrow[i] < 8)
+				toosmall = true;
+
+		if (!toosmall)
+			break;
+	}
+
+	trueperspective.bandrow[0] = 0;
+	trueperspective.bandrow[num] = viewheight;
+	trueperspective.numbands = num;
+}
+
+// Returns how far to shear the view for the current aiming angle.
+// With true perspective, this is for the band being rendered.
+fixed_t R_GetAimingShear(void)
+{
+	fixed_t zoom = FRACUNIT;
+	float top = 0.0f, bottom = 0.0f;
+
+	trueperspective.use = false;
+
+	if (cv_trueperspective.value && aimingangle && !splitscreen && !viewmorph.use)
+	{
+		const float focal = (viewwidth / 2.0f) / FIXED_TO_FLOAT(trueperspective.basefovtan);
+		const float halfheight = viewheight / 2.0f;
+		// The furthest the camera can tilt before the top or bottom row needs too wide a view
+		const float maxangle = acosf(1.0f / (TRUEPERSPECTIVE_MAXZOOM * sqrtf(1.0f + ((halfheight / focal) * (halfheight / focal)))))
+			- atanf(halfheight / focal);
+		float angle = (float)(INT32)aimingangle * (float)(M_PIl / 2147483648.0);
+		float topdepth, bottomdepth, needed;
+
+		angle = max(min(angle, maxangle), -maxangle);
+
+		trueperspective.sine = sinf(angle);
+		trueperspective.cosine = cosf(angle);
+
+		if (trueperspective.band == 0)
+			R_SetTruePerspectiveBands(focal);
+
+		top = R_GetTruePerspectiveSlope(trueperspective.bandrow[trueperspective.band] - halfheight, focal, &topdepth);
+		bottom = R_GetTruePerspectiveSlope(trueperspective.bandrow[trueperspective.band + 1] - halfheight, focal, &bottomdepth);
+
+		needed = focal / min(topdepth, bottomdepth); // rows are never stretched
+		needed = max(needed, (focal * (top - bottom)) / (viewheight - 2)); // and all of them fit
+		needed = max(needed, 1.0f);
+
+		// A little spare, and not a new value for every tiny change
+		zoom = (fixed_t)(needed * 1.01f * FRACUNIT) | 0x3FF;
+
+		trueperspective.use = true;
+	}
+
+	if (zoom != trueperspective.zoom)
+	{
+		trueperspective.zoom = zoom;
+		R_SetFov(trueperspective.fov);
+	}
+
+	if (!trueperspective.use)
+		return FixedMul(AIMINGTODY(aimingangle), FixedDiv(viewwidth<<FRACBITS, BASEVIDWIDTH<<FRACBITS));
+
+	// Put what the band sees in the middle of the sheared view.
+	{
+		float shear = FIXED_TO_FLOAT(projection) * (top + bottom) / 2.0f;
+		shear = max(min(shear, viewheight * 7.0f), viewheight * -7.0f);
+		trueperspective.horizon = (viewheight / 2.0f) + shear;
+		trueperspective.cliptop = max((INT32)(trueperspective.horizon - (FIXED_TO_FLOAT(projection) * top)) - 2, 0);
+		trueperspective.clipbottom = min((INT32)(trueperspective.horizon - (FIXED_TO_FLOAT(projection) * bottom)) + 3, viewheight);
+		return (fixed_t)(shear * FRACUNIT);
+	}
 }
 
 //
@@ -1169,7 +1367,11 @@ void R_SetupFrame(player_t *player)
 		}
 	}
 
-	if (quake.time && !ispaused)
+	if (trueperspective.band > 0)
+	{
+		// the same view as the first band
+	}
+	else if (quake.time && !ispaused)
 	{
 		fixed_t ir = quake.intensity>>1;
 
@@ -1505,7 +1707,33 @@ static void Mask_Post (maskcount_t* m)
 
 static fixed_t viewfov[2];
 
+static void R_RenderView(player_t *player);
+
 void R_RenderPlayerView(player_t *player)
+{
+	trueperspective.band = 0;
+	trueperspective.numbands = 1;
+
+	// With true perspective, this is once for every band.
+	do
+	{
+		R_RenderView(player);
+
+		if (trueperspective.use)
+			R_ApplyTruePerspective();
+	}
+	while (trueperspective.use && ++trueperspective.band < trueperspective.numbands);
+
+	if (trueperspective.use)
+	{
+		VID_BlitLinearScreen(screens[4], screens[0],
+				vid.width*vid.bpp, viewheight, vid.width*vid.bpp, vid.rowbytes);
+	}
+
+	trueperspective.band = 0;
+}
+
+static void R_RenderView(player_t *player)
 {
 	INT32			nummasks	= 1;
 	maskcount_t*	masks		= malloc(sizeof(maskcount_t));
@@ -1550,6 +1778,16 @@ void R_RenderPlayerView(player_t *player)
 		portalclipstart = 0;
 		portalclipend = viewwidth;
 		R_ClearClipSegs();
+	}
+	if (trueperspective.use)
+	{
+		// Only the rows that the band is warped from have to be drawn.
+		INT32 i;
+		for (i = 0; i < viewwidth; i++)
+		{
+			ceilingclip[i] = (INT16)(trueperspective.cliptop - 1);
+			floorclip[i] = (INT16)trueperspective.clipbottom;
+		}
 	}
 	R_ClearDrawSegs();
 	R_ClearSegTables();
@@ -1663,6 +1901,7 @@ void R_RegisterEngineStuff(void)
 	CV_RegisterVar(&cv_drawdist_precip);
 	CV_RegisterVar(&cv_fovchange);
 	CV_RegisterVar(&cv_fov);
+	CV_RegisterVar(&cv_trueperspective);
 
 	CV_RegisterVar(&cv_chasecam);
 	CV_RegisterVar(&cv_chasecam2);

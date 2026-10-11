@@ -159,7 +159,7 @@ static void R_SetupFreelook(player_t *player, boolean skybox)
 	centeryfrac = (viewheight/2)<<FRACBITS;
 
 	if (rendermode == render_soft)
-		centeryfrac += FixedMul(AIMINGTODY(aimingangle), FixedDiv(viewwidth<<FRACBITS, BASEVIDWIDTH<<FRACBITS));
+		centeryfrac += R_GetAimingShear();
 
 	centery = FixedInt(FixedRound(centeryfrac));
 
