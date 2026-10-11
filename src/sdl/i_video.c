@@ -133,6 +133,13 @@ static      SDL_Surface *vidSurface = NULL;
 static      SDL_Surface *bufSurface = NULL;
 static      SDL_Surface *icoSurface = NULL;
 static      SDL_Color    localPalette[256];
+
+// Truecolor frame buffer pixels are RGBA_t, which is red, green, blue, unused in memory.
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+#define TRUECOLOR_PIXELFORMAT SDL_PIXELFORMAT_RGBX8888
+#else
+#define TRUECOLOR_PIXELFORMAT SDL_PIXELFORMAT_BGR888
+#endif
 #if 0
 static      SDL_Rect   **modeList = NULL;
 static       Uint8       BitsPerPixel = 16;
@@ -254,7 +261,13 @@ static void SDLSetMode(INT32 width, INT32 height, SDL_bool fullscreen, SDL_bool 
 			SDL_DestroyTexture(texture);
 		}
 
-		if (!usesdl2soft)
+		if (vid.bpp == 4)
+		{
+			// Truecolor: same layout as the game's buffer, so it can be uploaded as is.
+			bpp = 32;
+			sw_texture_format = TRUECOLOR_PIXELFORMAT;
+		}
+		else if (!usesdl2soft)
 		{
 			sw_texture_format = SDL_PIXELFORMAT_RGB565;
 		}
@@ -1318,7 +1331,12 @@ void I_FinishUpdate(void)
 			Impl_VideoSetupSDLBuffer();
 		}
 
-		if (bufSurface)
+		if (vid.bpp == 4)
+		{
+			// The texture has the same format as the game's buffer.
+			SDL_UpdateTexture(texture, &src_rect, screens[0], (int)vid.rowbytes);
+		}
+		else if (bufSurface)
 		{
 			SDL_BlitSurface(bufSurface, &src_rect, vidSurface, &src_rect);
 			// Fury -- there's no way around UpdateTexture, the GL backend uses it anyway
@@ -1387,7 +1405,7 @@ void I_SetPalette(RGBA_t *palette)
 	}
 	//if (vidSurface) SDL_SetPaletteColors(vidSurface->format->palette, localPalette, 0, 256);
 	// Fury -- SDL2 vidSurface is a 32-bit surface buffer copied to the texture. It's not palletized, like bufSurface.
-	if (bufSurface) SDL_SetPaletteColors(bufSurface->format->palette, localPalette, 0, 256);
+	if (bufSurface && bufSurface->format->palette) SDL_SetPaletteColors(bufSurface->format->palette, localPalette, 0, 256);
 }
 
 // return number of fullscreen + X11 modes
@@ -1578,6 +1596,9 @@ boolean VID_CheckRenderer(void)
 		setrenderneeded = 0;
 	}
 
+	// Now that the renderer is known, decide how the game draws.
+	vid.bpp = SCR_GetBytesPerPixel();
+
 	SDLSetMode(vid.width, vid.height, USE_FULLSCREEN, (setmodeneeded ? SDL_TRUE : SDL_FALSE));
 	Impl_VideoSetupBuffer();
 
@@ -1628,7 +1649,6 @@ INT32 VID_SetMode(INT32 modeNum)
 	SDLdoUngrabMouse();
 
 	vid.recalc = 1;
-	vid.bpp = 1;
 
 	if (modeNum < 0)
 		modeNum = 0;
@@ -1726,9 +1746,15 @@ static void Impl_VideoSetupSDLBuffer(void)
 		bufSurface = SDL_CreateRGBSurfaceFrom(screens[0],vid.width,vid.height,15,
 			(int)vid.rowbytes,0x00007C00,0x000003E0,0x0000001F,0x00000000); // 555 mode
 	}
+	else if (vid.bpp == 4) // truecolor; presented straight from the buffer, see I_FinishUpdate
+	{
+		bufSurface = SDL_CreateRGBSurfaceWithFormatFrom(screens[0],vid.width,vid.height,32,
+			(int)vid.rowbytes,TRUECOLOR_PIXELFORMAT);
+	}
 	if (bufSurface)
 	{
-		SDL_SetPaletteColors(bufSurface->format->palette, localPalette, 0, 256);
+		if (bufSurface->format->palette)
+			SDL_SetPaletteColors(bufSurface->format->palette, localPalette, 0, 256);
 	}
 	else
 	{
@@ -1859,7 +1885,7 @@ void I_StartupGraphics(void)
 	vid.height = BASEVIDHEIGHT; // BitsPerPixel is the SDL interface's
 	vid.recalc = true; // Set up the console stufff
 	vid.direct = NULL; // Maybe direct access?
-	vid.bpp = 1; // This is the game engine's Bpp
+	vid.bpp = SCR_GetBytesPerPixel(); // This is the game engine's Bpp
 	vid.WndParent = NULL; //For the window?
 
 #ifdef HAVE_TTF

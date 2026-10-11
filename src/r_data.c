@@ -424,6 +424,10 @@ void R_ReInitColormaps(UINT16 num)
 //
 void R_ClearColormaps(void)
 {
+	// The light tables of the last level are gone, as far as truecolor is concerned
+	R_ClearTruecolorLightTables();
+	R_RegisterLightTable(colormaps, W_LumpLength(W_GetNumForName("COLORMAP")), NULL);
+
 	// Purged by PU_LEVEL, just overwrite the pointer
 	extra_colormaps = R_CreateDefaultColormap(true);
 }
@@ -844,6 +848,9 @@ void R_GenerateLightTable(extracolormap_t *extra_colormap, boolean uselookup)
 			}
 		}
 	}
+
+	// The truecolor drawers redo this in RGB.
+	R_RegisterLightTable(extra_colormap->colormap, 256 * 34, extra_colormap);
 }
 
 void R_UpdateLightTable(extracolormap_t *extra_colormap, boolean uselookup)

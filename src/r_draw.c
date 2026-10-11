@@ -738,3 +738,496 @@ static void R_CalcSlopeLight(void)
 
 #include "r_draw8.c"
 #include "r_draw8_npo2.c"
+
+// ==========================================================================
+//                        TRUECOLOR (32bpp) SUPPORT
+// ==========================================================================
+
+UINT32 tc_palette[NUM_PALETTE_ENTRIES];
+
+// If the current palette is one of the flash palettes, lighting can't be
+// worked out in RGB, since those palettes aren't a function of the color.
+static boolean tc_flashpalette = false;
+
+#define TC_LIGHTLEVELS 32 // rows of a light table that are light levels
+#define TC_MAXROWS 64
+
+typedef struct
+{
+	const lighttable_t *base; // the 8bpp light table
+	size_t size;              // its size in bytes
+	UINT32 *table;            // truecolor version of it, made when first needed
+	boolean dirty;
+	UINT32 lastuse;
+
+	// Light tables made by R_GenerateLightTable are redone from the same values.
+	// Any other table is assumed to go from its first row to its 32nd.
+	boolean generated;
+	UINT8 fadestart, fadedist;
+	double tint[3], untinted, fade[3];
+
+	UINT8 fadecolor[3];
+	UINT16 rowfade[TC_MAXROWS]; // how faded each row is, from 0 to 256
+} tclight_t;
+
+static tclight_t *tc_lights = NULL;
+static size_t tc_numlights = 0, tc_maxlights = 0;
+static UINT32 tc_lightuse = 0;
+
+// Rows of light tables that were looked up recently.
+#define TC_CACHESIZE 1024
+
+static struct
+{
+	const lighttable_t *colormap;
+	tclight_t *light;
+} tc_lightcache[TC_CACHESIZE];
+
+#define TC_SQRTSHIFT 6
+static UINT16 tc_sqrt[((3 * 255 * 255) >> TC_SQRTSHIFT) + 1];
+
+static void TC_FlushLightCache(void)
+{
+	memset(tc_lightcache, 0, sizeof(tc_lightcache));
+}
+
+void R_SetTruecolorPalette(const RGBA_t *palette, boolean flash)
+{
+	UINT32 newpalette[NUM_PALETTE_ENTRIES];
+	size_t i;
+
+	for (i = 0; i < NUM_PALETTE_ENTRIES; i++)
+	{
+		RGBA_t color = palette[i];
+		color.s.alpha = 0xFF;
+		newpalette[i] = color.rgba;
+	}
+
+	if (flash == tc_flashpalette && !memcmp(newpalette, tc_palette, sizeof(tc_palette)))
+		return;
+
+	memcpy(tc_palette, newpalette, sizeof(tc_palette));
+	tc_flashpalette = flash;
+
+	for (i = 0; i < tc_numlights; i++)
+		tc_lights[i].dirty = true;
+	TC_FlushLightCache();
+}
+
+void R_ClearTruecolorLightTables(void)
+{
+	size_t i;
+
+	for (i = 0; i < tc_numlights; i++)
+		free(tc_lights[i].table);
+
+	tc_numlights = 0;
+	TC_FlushLightCache();
+}
+
+// Tells the truecolor drawers about a light table.
+// If extra_colormap is given, the table must have come from R_GenerateLightTable.
+void R_RegisterLightTable(const lighttable_t *table, size_t size, const extracolormap_t *extra_colormap)
+{
+	tclight_t *light = NULL;
+	size_t i;
+
+	size -= (size % 256);
+	if (!table || !size)
+		return;
+
+	tc_lightuse++;
+	TC_FlushLightCache();
+
+	for (i = 0; i < tc_numlights;)
+	{
+		tclight_t *other = &tc_lights[i];
+
+		if (other->base == table && other->size == size)
+			light = other;
+		else if (table < other->base + other->size && other->base < table + size)
+		{
+			// Whatever this was, it has been replaced.
+			free(other->table);
+			*other = tc_lights[--tc_numlights];
+			if (light == &tc_lights[tc_numlights])
+				light = other;
+			continue;
+		}
+		else if (tc_numlights > 64 && other->table && other->lastuse + 64 < tc_lightuse)
+		{
+			// Colormap fades leave a lot of these behind.
+			free(other->table);
+			other->table = NULL;
+		}
+
+		i++;
+	}
+
+	if (!light)
+	{
+		if (tc_numlights == tc_maxlights)
+		{
+			tc_maxlights = tc_maxlights ? tc_maxlights * 2 : 32;
+			tc_lights = realloc(tc_lights, tc_maxlights * sizeof(*tc_lights));
+			if (!tc_lights)
+				I_Error("R_RegisterLightTable: out of memory");
+		}
+
+		light = &tc_lights[tc_numlights++];
+		light->table = NULL;
+	}
+
+	light->base = table;
+	light->size = size;
+	light->dirty = true;
+	light->lastuse = tc_lightuse;
+	light->generated = (extra_colormap != NULL);
+
+	if (extra_colormap)
+	{
+		// Same values as R_GenerateLightTable
+		double maskamt = R_GetRgbaA(extra_colormap->rgba) / 255.0;
+
+		light->untinted = 1.0 - maskamt;
+		maskamt /= 0xff;
+
+		light->tint[0] = R_GetRgbaR(extra_colormap->rgba) * maskamt;
+		light->tint[1] = R_GetRgbaG(extra_colormap->rgba) * maskamt;
+		light->tint[2] = R_GetRgbaB(extra_colormap->rgba) * maskamt;
+
+		light->fade[0] = R_GetRgbaR(extra_colormap->fadergba);
+		light->fade[1] = R_GetRgbaG(extra_colormap->fadergba);
+		light->fade[2] = R_GetRgbaB(extra_colormap->fadergba);
+
+		light->fadestart = extra_colormap->fadestart;
+		light->fadedist = extra_colormap->fadeend - extra_colormap->fadestart;
+	}
+}
+
+static void TC_BuildLightTable(tclight_t *light)
+{
+	const lighttable_t *source = light->base;
+	const size_t rows = light->size / 256;
+	size_t row, i;
+	UINT32 *dest;
+	INT32 c;
+
+	if (!light->table)
+	{
+		light->table = malloc(rows * 256 * sizeof(UINT32));
+		if (!light->table)
+			I_Error("TC_BuildLightTable: out of memory");
+	}
+
+	dest = light->table;
+	light->dirty = false;
+
+	if (light->generated)
+	{
+		double map[256][3];
+
+		for (i = 0; i < 256; i++)
+		{
+			const double r = pMasterPalette[i].s.red;
+			const double g = pMasterPalette[i].s.green;
+			const double b = pMasterPalette[i].s.blue;
+			const double brightness = sqrt((r*r) + (g*g) + (b*b));
+
+			map[i][0] = min((brightness * light->tint[0]) + (r * light->untinted), 255.0);
+			map[i][1] = min((brightness * light->tint[1]) + (g * light->untinted), 255.0);
+			map[i][2] = min((brightness * light->tint[2]) + (b * light->untinted), 255.0);
+		}
+
+		for (c = 0; c < 3; c++)
+			light->fadecolor[c] = (UINT8)light->fade[c];
+		V_CubeApply(&light->fadecolor[0], &light->fadecolor[1], &light->fadecolor[2]);
+
+		for (row = 0; row < rows; row++)
+		{
+			double fade = 0.0;
+
+			if (row > light->fadestart)
+			{
+				fade = 1.0;
+				if (light->fadedist && (row - light->fadestart) < light->fadedist)
+					fade = (double)(row - light->fadestart) / light->fadedist;
+			}
+
+			if (row < TC_MAXROWS)
+				light->rowfade[row] = (UINT16)(fade * 256.0);
+
+			if (tc_flashpalette)
+			{
+				for (i = 0; i < 256; i++)
+					*dest++ = tc_palette[*source++];
+				continue;
+			}
+
+			for (i = 0; i < 256; i++)
+			{
+				RGBA_t color;
+				color.s.red   = (UINT8)(map[i][0] + ((light->fade[0] - map[i][0]) * fade) + 0.5);
+				color.s.green = (UINT8)(map[i][1] + ((light->fade[1] - map[i][1]) * fade) + 0.5);
+				color.s.blue  = (UINT8)(map[i][2] + ((light->fade[2] - map[i][2]) * fade) + 0.5);
+				color.s.alpha = 0xFF;
+				V_CubeApply(&color.s.red, &color.s.green, &color.s.blue);
+				*dest++ = color.rgba;
+			}
+		}
+	}
+	else
+	{
+		const lighttable_t *darkest = source + ((TC_LIGHTLEVELS - 1) * 256);
+		INT32 total[3] = {0, 0, 0};
+		double range = 0.0;
+
+		light->tint[0] = light->tint[1] = light->tint[2] = 0.0;
+		light->untinted = 1.0;
+		light->fadecolor[0] = light->fadecolor[1] = light->fadecolor[2] = 0;
+		memset(light->rowfade, 0, sizeof(light->rowfade));
+
+		if (rows >= TC_LIGHTLEVELS)
+		{
+			// Lumps don't say how they were made, so work out how far each row
+			// has gone from the first row to the darkest one, and fade by that.
+			for (i = 0; i < 256; i++)
+			{
+				RGBA_t bright, dark;
+				bright.rgba = tc_palette[source[i]];
+				dark.rgba = tc_palette[darkest[i]];
+
+				total[0] += dark.s.red;
+				total[1] += dark.s.green;
+				total[2] += dark.s.blue;
+
+				range += (double)(dark.s.red - bright.s.red) * (dark.s.red - bright.s.red);
+				range += (double)(dark.s.green - bright.s.green) * (dark.s.green - bright.s.green);
+				range += (double)(dark.s.blue - bright.s.blue) * (dark.s.blue - bright.s.blue);
+			}
+
+			for (c = 0; c < 3; c++)
+				light->fadecolor[c] = (UINT8)(total[c] / 256);
+
+			for (row = 0; row < rows && row < TC_MAXROWS; row++)
+			{
+				const lighttable_t *current = source + (row * 256);
+				double fade = 0.0;
+
+				for (i = 0; i < 256; i++)
+				{
+					RGBA_t bright, dark, color;
+					bright.rgba = tc_palette[source[i]];
+					dark.rgba = tc_palette[darkest[i]];
+					color.rgba = tc_palette[current[i]];
+
+					fade += (double)(color.s.red - bright.s.red) * (dark.s.red - bright.s.red);
+					fade += (double)(color.s.green - bright.s.green) * (dark.s.green - bright.s.green);
+					fade += (double)(color.s.blue - bright.s.blue) * (dark.s.blue - bright.s.blue);
+				}
+
+				fade = (range > 0.0) ? (fade / range) : 0.0;
+				light->rowfade[row] = (UINT16)(max(min(fade, 1.0), 0.0) * 256.0);
+			}
+		}
+
+		for (row = 0; row < rows; row++)
+		{
+			const lighttable_t *current = source + (row * 256);
+
+			if (row < TC_LIGHTLEVELS && rows >= TC_LIGHTLEVELS && !tc_flashpalette)
+			{
+				for (i = 0; i < 256; i++)
+					*dest++ = TC_Mix(tc_palette[darkest[i]], tc_palette[source[i]], light->rowfade[row]);
+			}
+			else
+			{
+				for (i = 0; i < 256; i++)
+					*dest++ = tc_palette[current[i]];
+			}
+		}
+	}
+}
+
+static tclight_t *TC_FindLight(const lighttable_t *colormap)
+{
+	const size_t slot = ((size_t)colormap >> 8) & (TC_CACHESIZE - 1);
+	tclight_t *light = NULL;
+	size_t i;
+
+	if (tc_lightcache[slot].colormap == colormap && colormap)
+		return tc_lightcache[slot].light;
+
+	if (!colormap)
+		colormap = colormaps;
+
+	for (i = 0; i < tc_numlights; i++)
+	{
+		if (colormap >= tc_lights[i].base && colormap + 256 <= tc_lights[i].base + tc_lights[i].size)
+		{
+			light = &tc_lights[i];
+			break;
+		}
+	}
+
+	if (!light)
+	{
+		// Not a light table anyone said anything about, so only this row can be trusted.
+		R_RegisterLightTable(colormap, 256, NULL);
+		light = &tc_lights[tc_numlights - 1];
+	}
+
+	if (light->dirty || !light->table)
+		TC_BuildLightTable(light);
+
+	light->lastuse = tc_lightuse;
+
+	tc_lightcache[slot].colormap = colormap;
+	tc_lightcache[slot].light = light;
+
+	return light;
+}
+
+// Returns the truecolor version of a row of a light table.
+const UINT32 *R_GetTruecolorColormap(const lighttable_t *colormap)
+{
+	const tclight_t *light = TC_FindLight(colormap);
+
+	if (!colormap)
+		colormap = colormaps;
+
+	return light->table + (colormap - light->base);
+}
+
+// Returns what a row of a light table does to a color.
+// This is for the drawers that apply light tables to the frame buffer.
+void R_GetTruecolorShade(const lighttable_t *colormap, tcshade_t *shade)
+{
+	const tclight_t *light = TC_FindLight(colormap);
+	size_t row;
+	INT32 c;
+
+	if (!colormap)
+		colormap = colormaps;
+
+	if (!tc_sqrt[1])
+	{
+		size_t i;
+		for (i = 0; i < sizeof(tc_sqrt) / sizeof(tc_sqrt[0]); i++)
+			tc_sqrt[i] = (UINT16)(sqrt((double)((i << TC_SQRTSHIFT) + (1 << (TC_SQRTSHIFT - 1)))) + 0.5);
+	}
+
+	row = (colormap - light->base) >> 8;
+
+	shade->tinted = (light->untinted < 1.0);
+	shade->untinted = (UINT32)(light->untinted * 256.0);
+	shade->fadeamount = (row < TC_MAXROWS) ? light->rowfade[row] : 256;
+
+	for (c = 0; c < 3; c++)
+	{
+		shade->tint[c] = (UINT32)(light->tint[c] * 65536.0);
+		shade->fade[c] = light->fadecolor[c];
+	}
+}
+
+UINT32 R_ShadeTruecolorPixel(const tcshade_t *shade, UINT32 pixel)
+{
+	const INT32 amount = shade->fadeamount;
+	RGBA_t color;
+	INT32 r, g, b;
+
+	color.rgba = pixel;
+	r = color.s.red;
+	g = color.s.green;
+	b = color.s.blue;
+
+	if (shade->tinted)
+	{
+		const UINT32 brightness = tc_sqrt[((r*r) + (g*g) + (b*b)) >> TC_SQRTSHIFT];
+
+		r = ((brightness * shade->tint[0]) >> 16) + ((r * shade->untinted) >> 8);
+		g = ((brightness * shade->tint[1]) >> 16) + ((g * shade->untinted) >> 8);
+		b = ((brightness * shade->tint[2]) >> 16) + ((b * shade->untinted) >> 8);
+
+		if (r > 255) r = 255;
+		if (g > 255) g = 255;
+		if (b > 255) b = 255;
+	}
+
+	color.s.red   = (UINT8)(r + (((shade->fade[0] - r) * amount) / 256));
+	color.s.green = (UINT8)(g + (((shade->fade[1] - g) * amount) / 256));
+	color.s.blue  = (UINT8)(b + (((shade->fade[2] - b) * amount) / 256));
+	color.s.alpha = 0xFF;
+
+	return color.rgba;
+}
+
+// Works out what a translucency or blend table does, from the table.
+UINT32 R_GetTruecolorBlend(const UINT8 *transmap)
+{
+	INT32 i;
+
+	if (transmap && transmap >= transtables && transmap < transtables + (NUMTRANSTABLES * 0x10000))
+	{
+		const INT32 level = (transmap - transtables) >> FF_TRANSSHIFT;
+		return ((NUMTRANSTABLES - level) * 256) / (NUMTRANSTABLES + 1);
+	}
+
+	for (i = 0; transmap && i < NUMBLENDMAPS; i++)
+	{
+		if (blendtables[i] && transmap >= blendtables[i] && transmap < blendtables[i] + (BlendTab_Count[i] * 0x10000))
+		{
+			// See BlendTab_GenerateMaps
+			const INT32 level = (transmap - blendtables[i]) >> FF_TRANSSHIFT;
+			const UINT32 amount = min((UINT32)((256.0f / (float)(NUMTRANSTABLES + 1)) * level), 0xFF);
+
+			switch (i)
+			{
+				case blendtab_add:
+					return (TCBLEND_ADD << TCBLEND_MODESHIFT) | (((amount * 256) + 127) / 255);
+				case blendtab_subtract:
+					return (TCBLEND_SUBTRACT << TCBLEND_MODESHIFT) | amount;
+				case blendtab_reversesubtract:
+					return (TCBLEND_REVERSESUBTRACT << TCBLEND_MODESHIFT) | (((amount * 256) + 127) / 255);
+				default:
+					return (TCBLEND_MODULATE << TCBLEND_MODESHIFT);
+			}
+		}
+	}
+
+	return 128;
+}
+
+// The blend tables have the source and the frame buffer the other way around
+// to what the names would suggest, so this does too.
+UINT32 R_BlendTruecolorPixel(UINT32 source, UINT32 dest, UINT32 blend)
+{
+	const UINT32 amount = (blend & TCBLEND_AMOUNTMASK);
+
+	switch (blend >> TCBLEND_MODESHIFT)
+	{
+		case TCBLEND_ADD:
+			return TC_Mix(dest, TC_Add(source, dest), amount);
+		case TCBLEND_SUBTRACT:
+			return TC_Subtract(TC_Subtract(source, dest), amount * 0x01010101);
+		case TCBLEND_REVERSESUBTRACT:
+			return TC_Mix(dest, TC_Subtract(dest, source), amount);
+		case TCBLEND_MODULATE:
+		{
+			UINT32 result = 0;
+			INT32 shift;
+			for (shift = 0; shift < 32; shift += 8)
+				result |= ((((source >> shift) & 0xFF) * ((dest >> shift) & 0xFF)) >> 8) << shift;
+			return result;
+		}
+		default:
+			return TC_Mix(source, dest, amount);
+	}
+}
+
+// ==========================================================================
+//                   INCLUDE 32bpp DRAWING CODE HERE
+// ==========================================================================
+
+#include "r_draw32.c"
+#include "r_draw32_npo2.c"

@@ -45,6 +45,10 @@ extern UINT8 *yellowmap, *magentamap, *lgreenmap, *bluemap, *graymap, *redmap, *
 extern UINT8 *consolebgmap;
 extern UINT8 *promptbgmap;
 
+// What the two maps above were made from, for drawing them in truecolor: [0] console, [1] prompt
+extern UINT8 con_backpalindex[2];
+extern UINT8 con_backshift[2];
+
 void CON_SetupBackColormapEx(INT32 color, boolean prompt);
 void CON_SetupBackColormap(void);
 void CON_ClearHUD(void); // clear heads up messages

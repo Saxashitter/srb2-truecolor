@@ -68,6 +68,16 @@ raster_bbox_seg
 	if (h >= viewheight)
 		h = viewheight;
 
+	if (vid.bpp == 4)
+	{
+		while (y < h)
+		{
+			((UINT32 *)(void *)topleft)[x + y * vid.width] = tc_palette[pixel];
+			y++;
+		}
+		return;
+	}
+
 	while (y < h)
 	{
 		topleft[x + y * vid.width] = pixel;

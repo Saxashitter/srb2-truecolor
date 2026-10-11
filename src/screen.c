@@ -82,6 +82,11 @@ CV_PossibleValue_t cv_renderer_t[] = {
 
 consvar_t cv_renderer = CVAR_INIT ("renderer", "Software", CV_SAVE|CV_CALL, cv_renderer_t, SCR_ChangeRenderer);
 
+static void SCR_ChangeTruecolor(void);
+
+// Software renderer only: draw in 32-bit color instead of with the palette
+consvar_t cv_truecolor = CVAR_INIT ("truecolor", "Off", CV_SAVE|CV_CALL|CV_NOINIT, CV_OnOff, SCR_ChangeTruecolor);
+
 static void SCR_ChangeFullscreen(void);
 
 consvar_t cv_fullscreen = CVAR_INIT ("fullscreen", "Yes", CV_SAVE|CV_CALL, CV_YesNo, SCR_ChangeFullscreen);
@@ -99,7 +104,7 @@ void SCR_SetDrawFuncs(void)
 	//
 	//  setup the right draw routines
 	//
-	if (vid.bpp == 1) //Always run in 8bpp.
+	if (vid.bpp == 1)
 	{
 		colfuncs[BASEDRAWFUNC] = R_DrawColumn_8;
 		spanfuncs[BASEDRAWFUNC] = R_DrawSpan_8;
@@ -154,6 +159,62 @@ void SCR_SetDrawFuncs(void)
 		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_NPO2_8;
 		spanfuncs_npo2[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_NPO2_8;
 		spanfuncs_npo2[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_NPO2_8;
+	}
+	else if (vid.bpp == 4) // truecolor
+	{
+		colfuncs[BASEDRAWFUNC] = R_DrawColumn_32;
+		spanfuncs[BASEDRAWFUNC] = R_DrawSpan_32;
+
+		colfunc = colfuncs[BASEDRAWFUNC];
+		spanfunc = spanfuncs[BASEDRAWFUNC];
+
+		colfuncs[COLDRAWFUNC_FUZZY] = R_DrawTranslucentColumn_32;
+		colfuncs[COLDRAWFUNC_TRANS] = R_DrawTranslatedColumn_32;
+		colfuncs[COLDRAWFUNC_SHADE] = R_DrawShadeColumn_32;
+		colfuncs[COLDRAWFUNC_SHADOWED] = R_DrawColumnShadowed_32;
+		colfuncs[COLDRAWFUNC_TRANSTRANS] = R_DrawTranslatedTranslucentColumn_32;
+		colfuncs[COLDRAWFUNC_CLAMPED] = R_DrawColumnClamped_32;
+		colfuncs[COLDRAWFUNC_CLAMPEDTRANS] = R_DrawTranslucentColumnClamped_32;
+		colfuncs[COLDRAWFUNC_TWOSMULTIPATCH] = R_Draw2sMultiPatchColumn_32;
+		colfuncs[COLDRAWFUNC_TWOSMULTIPATCHTRANS] = R_Draw2sMultiPatchTranslucentColumn_32;
+		colfuncs[COLDRAWFUNC_FOG] = R_DrawFogColumn_32;
+
+		spanfuncs[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_32;
+		spanfuncs[SPANDRAWFUNC_SPLAT] = R_DrawSplat_32;
+		spanfuncs[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSPLAT] = R_DrawTiltedTranslucentSplat_32;
+		spanfuncs[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_32;
+		spanfuncs[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_32;
+		spanfuncs[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_32;
+		spanfuncs[SPANDRAWFUNC_SOLID] = R_DrawSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_TRANSSOLID] = R_DrawTransSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDSOLID] = R_DrawTiltedSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDTRANSSOLID] = R_DrawTiltedTransSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_WATERSOLID] = R_DrawWaterSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDWATERSOLID] = R_DrawTiltedWaterSolidColorSpan_32;
+		spanfuncs[SPANDRAWFUNC_FOG] = R_DrawFogSpan_32;
+		spanfuncs[SPANDRAWFUNC_TILTEDFOG] = R_DrawTiltedFogSpan_32;
+
+		spanfuncs_npo2[BASEDRAWFUNC] = R_DrawSpan_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANS] = R_DrawTranslucentSpan_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTED] = R_DrawTiltedSpan_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANS] = R_DrawTiltedTranslucentSpan_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_SPLAT] = R_DrawSplat_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANSSPLAT] = R_DrawTranslucentSplat_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPLAT] = R_DrawTiltedSplat_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPLAT] = R_DrawTiltedTranslucentSplat_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_SPRITE] = R_DrawFloorSprite_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TRANSSPRITE] = R_DrawTranslucentFloorSprite_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDSPRITE] = R_DrawTiltedFloorSprite_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDTRANSSPRITE] = R_DrawTiltedTranslucentFloorSprite_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_WATER] = R_DrawWaterSpan_NPO2_32;
+		spanfuncs_npo2[SPANDRAWFUNC_TILTEDWATER] = R_DrawTiltedWaterSpan_NPO2_32;
 	}
 	else
 		I_Error("unknown bytes per pixel mode %d\n", vid.bpp);
@@ -340,6 +401,26 @@ void SCR_ChangeFullscreen(void)
 	}
 	return;
 #endif
+}
+
+// Bytes per pixel the game should be drawing with
+INT32 SCR_GetBytesPerPixel(void)
+{
+	return (rendermode == render_soft && cv_truecolor.value) ? 4 : 1;
+}
+
+static void SCR_ChangeTruecolor(void)
+{
+	if (!graphics_started || rendermode != render_soft || vid.bpp == SCR_GetBytesPerPixel())
+		return;
+
+	// stop recording movies (APNG only)
+	if (moviemode == MM_APNG)
+		M_StopMovie();
+
+	// The video buffers have to be remade, so set the same mode again.
+	if (!setmodeneeded)
+		setmodeneeded = VID_GetModeForSize(vid.width, vid.height) + 1;
 }
 
 void SCR_ChangeRenderer(void)

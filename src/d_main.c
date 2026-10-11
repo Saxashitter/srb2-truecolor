@@ -491,7 +491,7 @@ static void D_Display(void)
 				PS_START_TIMING(ps_rendercalltime);
 				if (players[displayplayer].mo || players[displayplayer].playerstate == PST_DEAD)
 				{
-					topleft = screens[0] + viewwindowy*vid.width + viewwindowx;
+					topleft = screens[0] + (viewwindowy*vid.width + viewwindowx)*vid.bpp;
 					objectsdrawn = 0;
 	#ifdef HWRENDER
 					if (rendermode != render_soft)
@@ -514,7 +514,7 @@ static void D_Display(void)
 #endif
 					if (rendermode != render_none)
 					{
-						topleft = screens[0] + viewwindowy*vid.width + viewwindowx;
+						topleft = screens[0] + (viewwindowy*vid.width + viewwindowx)*vid.bpp;
 
 						R_RenderPlayerView(&players[secondarydisplayplayer]);
 					}

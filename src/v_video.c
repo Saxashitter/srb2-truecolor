@@ -340,6 +340,9 @@ static void LoadPalette(const char *lumpname)
 		if (Cubeapply)
 			V_CubeApply(&pLocalPalette[i].s.red, &pLocalPalette[i].s.green, &pLocalPalette[i].s.blue);
 	}
+
+	if (palsize >= 256)
+		R_SetTruecolorPalette(pLocalPalette, false);
 }
 
 void V_CubeApply(UINT8 *red, UINT8 *green, UINT8 *blue)
@@ -415,6 +418,8 @@ void V_SetPalette(INT32 palettenum)
 {
 	if (!pLocalPalette)
 		LoadMapPalette();
+
+	R_SetTruecolorPalette(&pLocalPalette[palettenum*256], palettenum != 0);
 
 #ifdef HWRENDER
 	if (rendermode == render_opengl)
@@ -498,6 +503,79 @@ static inline UINT8 transmappedpdraw(const UINT8 *dest, const UINT8 *source, fix
 	return *(v_translevel + (((*(v_colormap + source[ofs>>FRACBITS]))<<8)&0xff00) + (*dest&0xff));
 }
 
+// Truecolor: screens[] hold 32-bit pixels, but the drawing functions here still count in
+// pixels from the start of the screen with their UINT8 pointers, so those pointers are
+// only positions. V_TRUEPIXEL turns one into the real address of the pixel.
+#define V_TRUECOLOR (vid.bpp == 4)
+#define V_TRUEPIXEL(screen, dest) ((UINT32 *)(void *)(screen) + ((dest) - (screen)))
+
+static UINT32 v_blend = 0;
+
+static inline UINT32 truecolorpdraw(UINT32 dest, UINT8 source)
+{
+	if (v_colormap)
+		source = v_colormap[source];
+	if (v_translevel)
+		return TC_Blend(tc_palette[source], dest, v_blend);
+	return tc_palette[source];
+}
+
+// Truecolor version of consolebgmap and promptbgmap: the same ramp of the palette,
+// picked by how bright the pixel is.
+static inline UINT32 truecolorconsoleback(UINT32 pixel, INT32 prompt)
+{
+	RGBA_t color;
+	color.rgba = pixel;
+	return tc_palette[(UINT8)(con_backpalindex[prompt] - ((color.s.red + color.s.green + color.s.blue) >> con_backshift[prompt]))];
+}
+
+// Truecolor version of fadecolormap: what a row takes away from a color
+// (or adds to it, for the white one). See R_CreateFadeColormaps.
+UINT32 V_GetFadeColormapAmount(INT32 row)
+{
+	const INT32 fade = row * (256 / FADECOLORMAPROWS);
+	RGBA_t amount;
+	amount.s.red = (UINT8)min(FADEREDFACTOR*fade/10, 255);
+	amount.s.green = (UINT8)min(FADEGREENFACTOR*fade/10, 255);
+	amount.s.blue = (UINT8)min(FADEBLUEFACTOR*fade/10, 255);
+	amount.s.alpha = 0;
+	return amount.rgba;
+}
+
+// Truecolor version of the tables V_DrawFadeScreen and V_DrawFadeFill pick from.
+static void V_TruecolorFade(UINT32 *dest, INT32 w, INT32 h, UINT16 color, UINT8 strength)
+{
+	INT32 x;
+
+	if ((color & 0x0F00) == 0x0A00 || (color & 0x0F00) == 0x0B00) // fadecolormap
+	{
+		const UINT32 amount = V_GetFadeColormapAmount(strength);
+		const boolean white = ((color & 0x0F00) == 0x0B00);
+
+		for (; h > 0; h--, dest += vid.width)
+			for (x = 0; x < w; x++)
+				dest[x] = white ? TC_Add(dest[x], amount) : TC_Subtract(dest[x], amount);
+	}
+	else if (color & 0xFF00) // COLORMAP
+	{
+		tcshade_t shade;
+		R_GetTruecolorShade(colormaps + strength*256, &shade);
+
+		for (; h > 0; h--, dest += vid.width)
+			for (x = 0; x < w; x++)
+				dest[x] = R_ShadeTruecolorPixel(&shade, dest[x]);
+	}
+	else // TRANSMAP
+	{
+		const UINT32 blend = R_GetTruecolorBlend(R_GetTranslucencyTable((9-strength)+1));
+		const UINT32 source = tc_palette[color];
+
+		for (; h > 0; h--, dest += vid.width)
+			for (x = 0; x < w; x++)
+				dest[x] = TC_Blend(source, dest[x], blend);
+	}
+}
+
 // Draws a patch scaled to arbitrary size.
 void V_DrawStretchyFixedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vscale, INT32 scrn, patch_t *patch, const UINT8 *colormap)
 {
@@ -545,6 +623,7 @@ void V_DrawStretchyFixedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vsca
 		if (alphalevel || blendmode)
 		{
 			v_translevel = R_GetBlendTable(blendmode+1, alphalevel);
+			v_blend = R_GetTruecolorBlend(v_translevel);
 			patchdrawfunc = translucentpdraw;
 		}
 	}
@@ -668,7 +747,7 @@ void V_DrawStretchyFixedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vsca
 	if (!desttop)
 		return;
 
-	deststop = desttop + vid.rowbytes * vid.height;
+	deststop = desttop + vid.width * vid.height;
 
 	if (scrn & V_NOSCALESTART)
 	{
@@ -771,7 +850,15 @@ void V_DrawStretchyFixedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vsca
 			for (ofs = 0; dest < deststop && (size_t)(ofs>>FRACBITS) < post->length; ofs += rowfrac)
 			{
 				if (dest >= screens[scrn&V_PARAMMASK]) // don't draw off the top of the screen (CRASH PREVENTION)
-					*dest = patchdrawfunc(dest, source, ofs);
+				{
+					if (V_TRUECOLOR)
+					{
+						UINT32 *pixel = V_TRUEPIXEL(screens[scrn&V_PARAMMASK], dest);
+						*pixel = truecolorpdraw(*pixel, source[ofs>>FRACBITS]);
+					}
+					else
+						*dest = patchdrawfunc(dest, source, ofs);
+				}
 				dest += vid.width;
 			}
 		}
@@ -824,6 +911,7 @@ void V_DrawCroppedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vscale, IN
 		if (alphalevel || blendmode)
 		{
 			v_translevel = R_GetBlendTable(blendmode+1, alphalevel);
+			v_blend = R_GetTruecolorBlend(v_translevel);
 			patchdrawfunc = translucentpdraw;
 		}
 	}
@@ -933,7 +1021,7 @@ void V_DrawCroppedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vscale, IN
 	if (!desttop)
 		return;
 
-	deststop = desttop + vid.rowbytes * vid.height;
+	deststop = desttop + vid.width * vid.height;
 
 	if (scrn & V_NOSCALESTART)
 	{
@@ -1001,7 +1089,7 @@ void V_DrawCroppedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vscale, IN
 			if (stplyr == &players[displayplayer]) // Player 1's screen, crop at the bottom
 			{
 				// Just put a big old stop sign halfway through the screen
-				deststop -= vid.rowbytes * (vid.height>>1);
+				deststop -= vid.width * (vid.height>>1);
 			}
 			else //if (stplyr == &players[secondarydisplayplayer]) // Player 2's screen, crop at the top
 			{
@@ -1041,7 +1129,15 @@ void V_DrawCroppedPatch(fixed_t x, fixed_t y, fixed_t pscale, fixed_t vscale, IN
 			for (; dest < deststop && (size_t)(ofs>>FRACBITS) < post->length && ((ofs - sy) + (topdelta<<FRACBITS)) < h; ofs += rowfrac)
 			{
 				if (dest >= screens[scrn&V_PARAMMASK]) // don't draw off the top of the screen (CRASH PREVENTION)
-					*dest = patchdrawfunc(dest, source, ofs);
+				{
+					if (V_TRUECOLOR)
+					{
+						UINT32 *pixel = V_TRUEPIXEL(screens[scrn&V_PARAMMASK], dest);
+						*pixel = truecolorpdraw(*pixel, source[ofs>>FRACBITS]);
+					}
+					else
+						*dest = patchdrawfunc(dest, source, ofs);
+				}
 				dest += vid.width;
 			}
 		}
@@ -1082,7 +1178,20 @@ void V_DrawBlock(INT32 x, INT32 y, INT32 scrn, INT32 width, INT32 height, const 
 #endif
 
 	dest = screens[scrn] + y*vid.width + x;
-	deststop = screens[scrn] + vid.rowbytes * vid.height;
+	deststop = screens[scrn] + vid.width * vid.height;
+
+	if (V_TRUECOLOR)
+	{
+		// src is still palettized
+		for (; height > 0 && dest + width <= deststop; height--, dest += vid.width)
+		{
+			UINT32 *pixel = V_TRUEPIXEL(screens[scrn], dest);
+			INT32 i;
+			for (i = 0; i < width; i++)
+				pixel[i] = tc_palette[*src++];
+		}
+		return;
+	}
 
 	while (height--)
 	{
@@ -1124,7 +1233,10 @@ void V_DrawFill(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c)
 			return; // invis
 
 		if (alphalevel || blendmode)
+		{
 			v_translevel = R_GetBlendTable(blendmode+1, alphalevel);
+			v_blend = R_GetTruecolorBlend(v_translevel);
+		}
 	}
 
 
@@ -1211,7 +1323,15 @@ void V_DrawFill(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c)
 	{
 		if (x == 0 && y == 0 && w == BASEVIDWIDTH && h == BASEVIDHEIGHT)
 		{ // Clear the entire screen, from dest to deststop. Yes, this really works.
-			memset(screens[0], (c&255), vid.width * vid.height * vid.bpp);
+			if (V_TRUECOLOR)
+			{
+				UINT32 *pixel = (UINT32 *)(void *)screens[0];
+				size_t count = vid.width * vid.height;
+				while (count--)
+					*pixel++ = tc_palette[c&255];
+			}
+			else
+				memset(screens[0], (c&255), vid.width * vid.height * vid.bpp);
 			return;
 		}
 
@@ -1269,9 +1389,30 @@ void V_DrawFill(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c)
 		h = vid.height - y;
 
 	dest = screens[0] + y*vid.width + x;
-	deststop = screens[0] + vid.rowbytes * vid.height;
+	deststop = screens[0] + vid.width * vid.height;
 
 	c &= 255;
+
+	if (V_TRUECOLOR)
+	{
+		UINT32 *pixel = V_TRUEPIXEL(screens[0], dest);
+		const UINT32 color = tc_palette[c];
+
+		for (; (--h >= 0) && dest < deststop; dest += vid.width, pixel += vid.width)
+		{
+			if (alphalevel)
+			{
+				for (x = 0; x < w; x++)
+					pixel[x] = TC_Blend(color, pixel[x], v_blend);
+			}
+			else
+			{
+				for (x = 0; x < w; x++)
+					pixel[x] = color;
+			}
+		}
+		return;
+	}
 
 	// borrowing this from jimitia's new hud drawing functions rq
 	if (alphalevel)
@@ -1484,9 +1625,27 @@ void V_DrawFillConsoleMap(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c)
 		h = vid.height-y;
 
 	dest = screens[0] + y*vid.width + x;
-	deststop = screens[0] + vid.rowbytes * vid.height;
+	deststop = screens[0] + vid.width * vid.height;
 
 	c &= 255;
+
+	if (V_TRUECOLOR)
+	{
+		UINT32 *pixel = V_TRUEPIXEL(screens[0], dest);
+		const UINT32 blend = alphalevel ? R_GetTruecolorBlend(R_GetTranslucencyTable(alphalevel)) : 0;
+		const UINT32 color = tc_palette[c];
+
+		for (; (--h >= 0) && dest < deststop; dest += vid.width, pixel += vid.width)
+		{
+			for (u = 0; u < w; u++)
+			{
+				pixel[u] = truecolorconsoleback(pixel[u], 0);
+				if (alphalevel)
+					pixel[u] = TC_Blend(color, pixel[u], blend);
+			}
+		}
+		return;
+	}
 
 	// Jimita (12-04-2018)
 	if (alphalevel)
@@ -1666,9 +1825,16 @@ void V_DrawFadeFill(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c, UINT16 color, U
 		h = vid.height-y;
 
 	dest = screens[0] + y*vid.width + x;
-	deststop = screens[0] + vid.rowbytes * vid.height;
+	deststop = screens[0] + vid.width * vid.height;
 
 	c &= 255;
+
+	if (V_TRUECOLOR)
+	{
+		// Only the COLORMAP and TRANSMAP fades here, as with the tables below.
+		V_TruecolorFade(V_TRUEPIXEL(screens[0], dest), w, h, (color & 0xFF00) ? 0xFF00 : color, strength);
+		return;
+	}
 
 	fadetable = ((color & 0xFF00) // Color is not palette index?
 		? ((UINT8 *)colormaps + strength*256) // Do COLORMAP fade.
@@ -1709,7 +1875,7 @@ void V_DrawFlatFill(INT32 x, INT32 y, INT32 w, INT32 h, lumpnum_t flatnum)
 	flat = W_CacheLumpNum(flatnum, PU_CACHE);
 
 	dest = screens[0] + y*vid.dup*vid.width + x*vid.dup;
-	deststop = screens[0] + vid.rowbytes * vid.height;
+	deststop = screens[0] + vid.width * vid.height;
 
 	// from V_DrawScaledPatch
 	if (vid.width != BASEVIDWIDTH * vid.dup)
@@ -1737,9 +1903,12 @@ void V_DrawFlatFill(INT32 x, INT32 y, INT32 w, INT32 h, lumpnum_t flatnum)
 		src = flat + (((yfrac>>FRACBITS) & (lflatsize - 1)) << flatshift);
 		for (u = 0; u < w; u++)
 		{
-			if (&dest[u] > deststop)
+			if (&dest[u] >= deststop)
 				return;
-			dest[u] = src[(xfrac>>FRACBITS)&(lflatsize-1)];
+			if (V_TRUECOLOR)
+				*V_TRUEPIXEL(screens[0], &dest[u]) = tc_palette[src[(xfrac>>FRACBITS)&(lflatsize-1)]];
+			else
+				dest[u] = src[(xfrac>>FRACBITS)&(lflatsize-1)];
 			xfrac += dx;
 		}
 		yfrac += dy;
@@ -1779,13 +1948,19 @@ void V_DrawFadeScreen(UINT16 color, UINT8 strength)
 	}
 #endif
 
+	if (V_TRUECOLOR)
+	{
+		V_TruecolorFade((UINT32 *)(void *)screens[0], vid.width, vid.height, color, strength);
+		return;
+	}
+
 	{
 		const UINT8 *fadetable = ((color & 0xFF00) // Color is not palette index?
 		? ((UINT8 *)(((color & 0x0F00) == 0x0A00) ? fadecolormap // Do fadecolormap fade.
 		: (((color & 0x0F00) == 0x0B00) ? fadecolormap + (256 * FADECOLORMAPROWS) // Do white fadecolormap fade.
 		: colormaps)) + strength*256) // Do COLORMAP fade.
 		: ((UINT8 *)R_GetTranslucencyTable((9-strength)+1) + color*256)); // Else, do TRANSMAP** fade.
-		const UINT8 *deststop = screens[0] + vid.rowbytes * vid.height;
+		const UINT8 *deststop = screens[0] + vid.width * vid.height;
 		UINT8 *buf = screens[0];
 
 		// heavily simplified -- we don't need to know x or y
@@ -1811,7 +1986,16 @@ void V_DrawFadeConsBack(INT32 plines)
 
 	// heavily simplified -- we don't need to know x or y position,
 	// just the stop position
-	deststop = screens[0] + vid.rowbytes * min(plines, vid.height);
+	if (V_TRUECOLOR)
+	{
+		UINT32 *pixel = (UINT32 *)(void *)screens[0];
+		const UINT32 *pixelstop = pixel + vid.width * min(plines, vid.height);
+		for (; pixel < pixelstop; ++pixel)
+			*pixel = truecolorconsoleback(*pixel, 0);
+		return;
+	}
+
+	deststop = screens[0] + vid.width * min(plines, vid.height);
 	for (buf = screens[0]; buf < deststop; ++buf)
 		*buf = consolebgmap[*buf];
 }
@@ -1873,11 +2057,19 @@ void V_DrawPromptBack(INT32 boxheight, INT32 color)
 
 	// heavily simplified -- we don't need to know x or y position,
 	// just the start and stop positions
-	buf = deststop = screens[0] + vid.rowbytes * vid.height;
+	buf = deststop = screens[0] + vid.width * vid.height;
 	if (boxheight < 0)
-		buf += vid.rowbytes * boxheight;
+		buf += vid.width * boxheight;
 	else // 4 lines of space plus gaps between and some leeway
-		buf -= vid.rowbytes * ((boxheight * 4) + (boxheight/2)*5);
+		buf -= vid.width * ((boxheight * 4) + (boxheight/2)*5);
+	if (V_TRUECOLOR)
+	{
+		UINT32 *pixel = V_TRUEPIXEL(screens[0], buf);
+		const UINT32 *pixelstop = V_TRUEPIXEL(screens[0], deststop);
+		for (; pixel < pixelstop; ++pixel)
+			*pixel = truecolorconsoleback(*pixel, 1);
+		return;
+	}
 	for (; buf < deststop; ++buf)
 		*buf = promptbgmap[*buf];
 }
@@ -2522,23 +2714,23 @@ void V_DoPostProcessor(INT32 view, postimg_t type, INT32 param)
 
 			if (sine < 0)
 			{
-				M_Memcpy(&tmpscr[y*vid.width+newpix], &srcscr[y*vid.width], vid.width-newpix);
+				M_Memcpy(&tmpscr[(y*vid.width+newpix)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], (vid.width-newpix)*vid.bpp);
 
 				// Cleanup edge
 				while (newpix)
 				{
-					tmpscr[y*vid.width+newpix] = srcscr[y*vid.width];
+					M_Memcpy(&tmpscr[(y*vid.width+newpix)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], vid.bpp);
 					newpix--;
 				}
 			}
 			else
 			{
-				M_Memcpy(&tmpscr[y*vid.width+0], &srcscr[y*vid.width+sine], vid.width-newpix);
+				M_Memcpy(&tmpscr[(y*vid.width+0)*vid.bpp], &srcscr[(y*vid.width+sine)*vid.bpp], (vid.width-newpix)*vid.bpp);
 
 				// Cleanup edge
 				while (newpix)
 				{
-					tmpscr[y*vid.width+vid.width-newpix] = srcscr[y*vid.width+(vid.width-1)];
+					M_Memcpy(&tmpscr[(y*vid.width+vid.width-newpix)*vid.bpp], &srcscr[(y*vid.width+(vid.width-1))*vid.bpp], vid.bpp);
 					newpix--;
 				}
 			}
@@ -2561,7 +2753,7 @@ Unoptimized version
 		}
 
 		VID_BlitLinearScreen(tmpscr+vid.width*vid.bpp*yoffset, screens[0]+vid.width*vid.bpp*yoffset,
-				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.width);
+				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.rowbytes);
 	}
 	else if (type == postimg_motion) // Motion Blur!
 	{
@@ -2576,12 +2768,18 @@ Unoptimized version
 		{
 			for (x = 0; x < vid.width; x++)
 			{
+				if (V_TRUECOLOR)
+				{
+					UINT32 *blur = (UINT32 *)(void *)tmpscr + (y*vid.width + x);
+					*blur = TC_Blend(((UINT32 *)(void *)srcscr)[y*vid.width + x], *blur, R_GetTruecolorBlend(transme));
+				}
+				else
 				tmpscr[y*vid.width + x]
 					=     colormaps[*(transme     + (srcscr   [y*vid.width+x ] <<8) + (tmpscr[y*vid.width+x]))];
 			}
 		}
 		VID_BlitLinearScreen(tmpscr+vid.width*vid.bpp*yoffset, screens[0]+vid.width*vid.bpp*yoffset,
-				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.width);
+				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.rowbytes);
 	}
 	else if (type == postimg_flip) // Flip the screen upside-down
 	{
@@ -2590,10 +2788,10 @@ Unoptimized version
 		INT32 y, y2;
 
 		for (y = yoffset, y2 = yoffset+height - 1; y < yoffset+height; y++, y2--)
-			M_Memcpy(&tmpscr[y2*vid.width], &srcscr[y*vid.width], vid.width);
+			M_Memcpy(&tmpscr[(y2*vid.width)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], (vid.width)*vid.bpp);
 
 		VID_BlitLinearScreen(tmpscr+vid.width*vid.bpp*yoffset, screens[0]+vid.width*vid.bpp*yoffset,
-				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.width);
+				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.rowbytes);
 	}
 	else if (type == postimg_heat) // Heat wave
 	{
@@ -2624,11 +2822,11 @@ Unoptimized version
 			if (heatshifter[heatindex[view]++])
 			{
 				// Shift this row of pixels to the right by 2
-				tmpscr[y*vid.width] = srcscr[y*vid.width];
-				M_Memcpy(&tmpscr[y*vid.width+vid.dup], &srcscr[y*vid.width], vid.width-vid.dup);
+				M_Memcpy(&tmpscr[(y*vid.width)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], vid.bpp);
+				M_Memcpy(&tmpscr[(y*vid.width+vid.dup)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], (vid.width-vid.dup)*vid.bpp);
 			}
 			else
-				M_Memcpy(&tmpscr[y*vid.width], &srcscr[y*vid.width], vid.width);
+				M_Memcpy(&tmpscr[(y*vid.width)*vid.bpp], &srcscr[(y*vid.width)*vid.bpp], (vid.width)*vid.bpp);
 
 			heatindex[view] %= height;
 		}
@@ -2640,7 +2838,7 @@ Unoptimized version
 		}
 
 		VID_BlitLinearScreen(tmpscr+vid.width*vid.bpp*yoffset, screens[0]+vid.width*vid.bpp*yoffset,
-				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.width);
+				vid.width*vid.bpp, height, vid.width*vid.bpp, vid.rowbytes);
 	}
 #endif
 }

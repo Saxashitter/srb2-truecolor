@@ -365,8 +365,22 @@ static void Y_RescaleScreenBuffer(void)
 	colfrac = FixedDiv(FRACUNIT, scalefac);
 
 	for (sy = 0, dy = 0; sy < (y_buffer->source_height << FRACBITS) && dy < y_buffer->target_height; sy += rowfrac, dy++)
-		for (sx = 0, dx = 0; sx < (y_buffer->source_width << FRACBITS) && dx < y_buffer->target_width; sx += colfrac, dx += y_buffer->target_bpp)
-			dest[(dy * y_buffer->target_rowbytes) + dx] = y_buffer->source_picture[((sy>>FRACBITS) * y_buffer->source_width) + (sx>>FRACBITS)];
+		for (sx = 0, dx = 0; sx < (y_buffer->source_width << FRACBITS) && dx < y_buffer->target_width; sx += colfrac, dx++)
+		{
+			const UINT8 *source = &y_buffer->source_picture[((sy>>FRACBITS) * y_buffer->source_rowbytes) + ((sx>>FRACBITS) * y_buffer->source_bpp)];
+			UINT8 *target = &dest[(dy * y_buffer->target_rowbytes) + (dx * y_buffer->target_bpp)];
+
+			if (y_buffer->source_bpp == y_buffer->target_bpp)
+				M_Memcpy(target, source, y_buffer->target_bpp);
+			else if (y_buffer->target_bpp == 4) // palettized picture, truecolor screen
+				M_Memcpy(target, &tc_palette[*source], 4);
+			else // truecolor picture, palettized screen
+			{
+				RGBA_t color;
+				M_Memcpy(&color, source, 4);
+				*target = NearestColor(color.s.red, color.s.green, color.s.blue);
+			}
+		}
 }
 
 //
@@ -416,7 +430,7 @@ void Y_IntermissionDrawer(void)
 			else
 			{
 				// Maybe the resolution changed?
-				if ((y_buffer->target_width != vid.width) || (y_buffer->target_height != vid.height))
+				if ((y_buffer->target_width != vid.width) || (y_buffer->target_height != vid.height) || (y_buffer->target_bpp != vid.bpp))
 					Y_RescaleScreenBuffer();
 
 				// Blit the already-scaled screen buffer to the current screen

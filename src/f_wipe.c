@@ -278,7 +278,7 @@ static void F_DoWipe(fademask_t *fademask)
 				// shortcut - memcpy source to work
 				while (draw_linestogo--)
 				{
-					M_Memcpy(w_base+relativepos, s_base+relativepos, draw_rowend-draw_rowstart);
+					M_Memcpy(w_base+(relativepos*vid.bpp), s_base+(relativepos*vid.bpp), (draw_rowend-draw_rowstart)*vid.bpp);
 					relativepos += vid.width;
 				}
 			}
@@ -287,7 +287,7 @@ static void F_DoWipe(fademask_t *fademask)
 				// shortcut - memcpy target to work
 				while (draw_linestogo--)
 				{
-					M_Memcpy(w_base+relativepos, e_base+relativepos, draw_rowend-draw_rowstart);
+					M_Memcpy(w_base+(relativepos*vid.bpp), e_base+(relativepos*vid.bpp), (draw_rowend-draw_rowstart)*vid.bpp);
 					relativepos += vid.width;
 				}
 			}
@@ -297,7 +297,20 @@ static void F_DoWipe(fademask_t *fademask)
 				transtbl = R_GetTranslucencyTable((9 - *mask) + 1);
 
 				// DRAWING LOOP
-				while (draw_linestogo--)
+				while (vid.bpp == 4 && draw_linestogo--)
+				{
+					const UINT32 blend = R_GetTruecolorBlend(transtbl);
+					UINT32 *w32 = (UINT32 *)(void *)w_base + relativepos;
+					const UINT32 *s32 = (const UINT32 *)(const void *)s_base + relativepos;
+					const UINT32 *e32 = (const UINT32 *)(const void *)e_base + relativepos;
+					draw_rowstogo = draw_rowend - draw_rowstart;
+
+					while (draw_rowstogo--)
+						*w32++ = TC_Blend(*e32++, *s32++, blend);
+
+					relativepos += vid.width;
+				}
+				while (vid.bpp != 4 && draw_linestogo--)
 				{
 					w = w_base + relativepos;
 					s = s_base + relativepos;
@@ -380,7 +393,7 @@ static void F_DoColormapWipe(fademask_t *fademask, UINT8 *colormap)
 				// shortcut - memcpy source to work
 				while (draw_linestogo--)
 				{
-					M_Memcpy(w_base+relativepos, s_base+relativepos, draw_rowend-draw_rowstart);
+					M_Memcpy(w_base+(relativepos*vid.bpp), s_base+(relativepos*vid.bpp), (draw_rowend-draw_rowstart)*vid.bpp);
 					relativepos += vid.width;
 				}
 			}
@@ -389,7 +402,7 @@ static void F_DoColormapWipe(fademask_t *fademask, UINT8 *colormap)
 				// shortcut - memcpy target to work
 				while (draw_linestogo--)
 				{
-					M_Memcpy(w_base+relativepos, e_base+relativepos, draw_rowend-draw_rowstart);
+					M_Memcpy(w_base+(relativepos*vid.bpp), e_base+(relativepos*vid.bpp), (draw_rowend-draw_rowstart)*vid.bpp);
 					relativepos += vid.width;
 				}
 			}
@@ -402,7 +415,28 @@ static void F_DoColormapWipe(fademask_t *fademask, UINT8 *colormap)
 				transtbl = colormap + (nmask * 256);
 
 				// DRAWING LOOP
-				while (draw_linestogo--)
+				while (vid.bpp == 4 && draw_linestogo--)
+				{
+					// fadecolormap as arithmetic; see V_GetFadeColormapAmount
+					const UINT32 amount = V_GetFadeColormapAmount(nmask);
+					UINT32 *w32 = (UINT32 *)(void *)w_base + relativepos;
+					const UINT32 *e32 = (const UINT32 *)(const void *)e_base + relativepos;
+					draw_rowstogo = draw_rowend - draw_rowstart;
+
+					if (wipestyleflags & WSF_TOWHITE)
+					{
+						while (draw_rowstogo--)
+							*w32++ = TC_Add(*e32++, amount);
+					}
+					else
+					{
+						while (draw_rowstogo--)
+							*w32++ = TC_Subtract(*e32++, amount);
+					}
+
+					relativepos += vid.width;
+				}
+				while (vid.bpp != 4 && draw_linestogo--)
 				{
 					w = w_base + relativepos;
 					s = s_base + relativepos;
@@ -458,7 +492,8 @@ void F_WipeEndScreen(void)
 #endif
 	wipe_scr_end = screens[4];
 	I_ReadScreen(wipe_scr_end);
-	V_DrawBlock(0, 0, 0, vid.width, vid.height, wipe_scr_start);
+	// wipe_scr_start is a whole screen, in whatever format the screen is in
+	M_Memcpy(screens[0], wipe_scr_start, vid.rowbytes * vid.height);
 #endif
 }
 

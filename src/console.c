@@ -289,6 +289,8 @@ UINT8 *yellowmap, *magentamap, *lgreenmap, *bluemap, *graymap, *redmap, *orangem
 // Console BG color
 UINT8 *consolebgmap = NULL;
 UINT8 *promptbgmap = NULL;
+UINT8 con_backpalindex[2] = {111, 31};
+UINT8 con_backshift[2] = {6, 6};
 static UINT8 promptbgcolor = UINT8_MAX;
 
 void CON_SetupBackColormapEx(INT32 color, boolean prompt)
@@ -340,6 +342,9 @@ void CON_SetupBackColormapEx(INT32 color, boolean prompt)
 	}
 	else if (!consolebgmap)
 		consolebgmap = (UINT8 *)Z_Malloc(256, PU_STATIC, NULL);
+
+	con_backpalindex[prompt ? 1 : 0] = palindex;
+	con_backshift[prompt ? 1 : 0] = (UINT8)shift;
 
 	// setup background colormap
 	for (i = 0, j = 0; i < 768; i += 3, j++)

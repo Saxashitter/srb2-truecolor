@@ -530,6 +530,38 @@ static void GIF_rgbconvert(UINT8 *linear, UINT8 *scr)
 #endif
 
 //
+// GIF_truecolorconvert
+// converts the truecolor software screen to a frame with a palette.
+//
+static colorlookup_t gif_truecolorlookup;
+static UINT8 *gif_truecolorscreen = NULL;
+static size_t gif_truecolorsize = 0;
+
+static UINT8 *GIF_truecolorconvert(void)
+{
+	const UINT32 *src = (const UINT32 *)(const void *)screens[0];
+	const size_t size = (vid.width * vid.height);
+	size_t i;
+
+	if (gif_truecolorsize != size)
+	{
+		gif_truecolorscreen = Z_Realloc(gif_truecolorscreen, size, PU_STATIC, NULL);
+		gif_truecolorsize = size;
+	}
+
+	InitColorLUT(&gif_truecolorlookup, (gif_localcolortable) ? gif_framepalette : gif_headerpalette, false);
+
+	for (i = 0; i < size; i++)
+	{
+		RGBA_t color;
+		color.rgba = src[i];
+		gif_truecolorscreen[i] = GetColorLUT(&gif_truecolorlookup, color.s.red, color.s.green, color.s.blue);
+	}
+
+	return gif_truecolorscreen;
+}
+
+//
 // GIF_framewrite
 // writes a frame into the file.
 //
@@ -537,6 +569,8 @@ static void GIF_framewrite(void)
 {
 	UINT8 *p;
 	UINT8 *movie_screen = screens[2];
+	UINT8 *cur_screen = screens[0];
+	boolean truecolor = (rendermode == render_soft && vid.bpp == 4);
 	INT32 blitx, blity, blitw, blith;
 	boolean palchanged;
 
@@ -556,16 +590,21 @@ static void GIF_framewrite(void)
 	else
 		palchanged = false;
 
+	// The LZW compressor needs a palettized frame.
+	if (truecolor)
+		cur_screen = GIF_truecolorconvert();
+
 	// Compare image data (for optimizing GIF)
 	// If the palette has changed, the entire frame is considered to be different.
 	if (gif_optimize && gif_frames > 0 && (!palchanged))
 	{
 		// before blit movie_screen points to last frame, cur_screen points to this frame
-		UINT8 *cur_screen = screens[0];
 		GIF_optimizeregion(cur_screen, movie_screen, &blitx, &blity, &blitw, &blith);
 
 		// blit to temp screen
-		if (rendermode == render_soft)
+		if (truecolor)
+			M_Memcpy(movie_screen, cur_screen, vid.width * vid.height);
+		else if (rendermode == render_soft)
 			I_ReadScreen(movie_screen);
 #ifdef HWRENDER
 		else if (rendermode == render_opengl)
@@ -594,10 +633,12 @@ static void GIF_framewrite(void)
 
 		// Copy the first frame into the movie screen
 		// OpenGL already does the same above.
-		if (gif_frames == 0 && rendermode == render_soft)
+		if (gif_frames == 0 && truecolor)
+			M_Memcpy(movie_screen, cur_screen, vid.width * vid.height);
+		else if (gif_frames == 0 && rendermode == render_soft)
 			I_ReadScreen(movie_screen);
 
-		movie_screen = screens[0];
+		movie_screen = cur_screen;
 	}
 
 	// screen regions are handled in GIF_lzw

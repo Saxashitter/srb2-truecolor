@@ -813,6 +813,15 @@ void R_CheckViewMorph(void)
 	viewmorph.use = true;
 }
 
+// Writes a pixel for the view morph debug grid.
+#define VIEWMORPH_PUT(pos, color) \
+	do { \
+		if (vid.bpp == 4) \
+			((UINT32 *)(void *)tmpscr)[pos] = (color); \
+		else \
+			tmpscr[pos] = (UINT8)(color); \
+	} while (0)
+
 void R_ApplyViewMorph(void)
 {
 	UINT8 *tmpscr = screens[4];
@@ -824,36 +833,50 @@ void R_ApplyViewMorph(void)
 
 	if (cv_debug & DBG_VIEWMORPH)
 	{
-		UINT8 border = 32;
-		UINT8 grid = 160;
+		UINT32 border = 32;
+		UINT32 grid = 160;
 		INT32 ws = vid.width / 4;
 		INT32 hs = vid.width * (vid.height / 4);
 
-		memcpy(tmpscr, srcscr, vid.width*vid.height);
+		memcpy(tmpscr, srcscr, vid.width*vid.height*vid.bpp);
+		if (vid.bpp == 4)
+		{
+			border = tc_palette[border];
+			grid = tc_palette[grid];
+		}
 		for (p = 0; p < vid.width; p++)
 		{
-			tmpscr[viewmorph.scrmap[p]] = border;
-			tmpscr[viewmorph.scrmap[p + hs]] = grid;
-			tmpscr[viewmorph.scrmap[p + hs*2]] = grid;
-			tmpscr[viewmorph.scrmap[p + hs*3]] = grid;
-			tmpscr[viewmorph.scrmap[end - 1 - p]] = border;
+			VIEWMORPH_PUT(viewmorph.scrmap[p], border);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + hs], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + hs*2], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + hs*3], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[end - 1 - p], border);
 		}
 		for (p = vid.width; p < end; p += vid.width)
 		{
-			tmpscr[viewmorph.scrmap[p]] = border;
-			tmpscr[viewmorph.scrmap[p + ws]] = grid;
-			tmpscr[viewmorph.scrmap[p + ws*2]] = grid;
-			tmpscr[viewmorph.scrmap[p + ws*3]] = grid;
-			tmpscr[viewmorph.scrmap[end - 1 - p]] = border;
+			VIEWMORPH_PUT(viewmorph.scrmap[p], border);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + ws], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + ws*2], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[p + ws*3], grid);
+			VIEWMORPH_PUT(viewmorph.scrmap[end - 1 - p], border);
 		}
+	}
+	else if (vid.bpp == 4)
+	{
+		const UINT32 *src32 = (const UINT32 *)(const void *)srcscr;
+		UINT32 *tmp32 = (UINT32 *)(void *)tmpscr;
+		for (p = 0; p < end; p++)
+			tmp32[p] = src32[viewmorph.scrmap[p]];
 	}
 	else
 		for (p = 0; p < end; p++)
 			tmpscr[p] = srcscr[viewmorph.scrmap[p]];
 
 	VID_BlitLinearScreen(tmpscr, screens[0],
-			vid.width*vid.bpp, vid.height, vid.width*vid.bpp, vid.width);
+			vid.width*vid.bpp, vid.height, vid.width*vid.bpp, vid.rowbytes);
 }
+
+#undef VIEWMORPH_PUT
 
 
 //

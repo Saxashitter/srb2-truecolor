@@ -672,6 +672,29 @@ void M_SaveConfig(const char *filename)
 //                              SCREENSHOTS
 // ==========================================================================
 static UINT8 screenshot_palette[768];
+// Copies the truecolor software screen as tightly packed RGB. The caller frees it.
+static UINT8 *M_GetTruecolorScreen(void)
+{
+	const UINT32 *src = (const UINT32 *)(const void *)screens[0];
+	const size_t size = (vid.width * vid.height);
+	UINT8 *rgb = malloc(size * 3), *dest = rgb;
+	size_t i;
+
+	if (!rgb)
+		return NULL;
+
+	for (i = 0; i < size; i++)
+	{
+		RGBA_t color;
+		color.rgba = src[i];
+		*dest++ = color.s.red;
+		*dest++ = color.s.green;
+		*dest++ = color.s.blue;
+	}
+
+	return rgb;
+}
+
 static void M_CreateScreenShotPalette(void)
 {
 	size_t i, j;
@@ -994,6 +1017,7 @@ static void M_PNGFrame(png_structp png_ptr, png_infop png_info_ptr, png_bytep pn
 
 	png_uint_32 pitch = png_get_rowbytes(png_ptr, png_info_ptr);
 	PNG_CONST png_uint_32 width = vid.width / downscale;
+	PNG_CONST png_uint_32 pixelbytes = pitch / width;
 	PNG_CONST png_uint_32 height = vid.height / downscale;
 	png_bytepp row_pointers = png_malloc(png_ptr, height * sizeof (png_bytep));
 	png_uint_32 x, y;
@@ -1005,7 +1029,7 @@ static void M_PNGFrame(png_structp png_ptr, png_infop png_info_ptr, png_bytep pn
 	{
 		row_pointers[y] = malloc(pitch * sizeof(png_byte));
 		for (x = 0; x < width; x++)
-			row_pointers[y][x] = png_buf[x * downscale];
+			memcpy(&row_pointers[y][x * pixelbytes], &png_buf[x * downscale * pixelbytes], pixelbytes);
 		png_buf += pitch * (downscale * downscale);
 	}
 		//for (x = 0; x < width; x++)
@@ -1148,7 +1172,7 @@ static inline moviemode_t M_StartMovieAPNG(const char *pathname)
 		return MM_OFF;
 	}
 
-	if (rendermode == render_soft)
+	if (rendermode == render_soft && vid.bpp == 1)
 	{
 		M_CreateScreenShotPalette();
 		palette = screenshot_palette;
@@ -1277,7 +1301,9 @@ void M_SaveFrame(void)
 					return;
 				}
 
-				if (rendermode == render_soft)
+				if (rendermode == render_soft && vid.bpp == 4)
+					linear = M_GetTruecolorScreen();
+				else if (rendermode == render_soft)
 				{
 					// munge planar buffer to linear
 					linear = screens[2];
@@ -1287,11 +1313,11 @@ void M_SaveFrame(void)
 				else
 					linear = HWR_GetScreenshot();
 #endif
+				if (!linear)
+					return;
 				M_PNGFrame(apng_ptr, apng_info_ptr, (png_bytep)linear);
-#ifdef HWRENDER
-				if (rendermode != render_soft && linear)
+				if (linear != screens[2])
 					free(linear);
-#endif
 
 				if (apng_frames == PNG_UINT_31_MAX)
 				{
@@ -1587,7 +1613,7 @@ void M_DoScreenShot(void)
 		freename = Newsnapshotfile(pathname,"tga");
 #endif
 
-	if (rendermode == render_soft)
+	if (rendermode == render_soft && vid.bpp == 1)
 	{
 		// munge planar buffer to linear
 		linear = screens[2];
@@ -1603,6 +1629,26 @@ void M_DoScreenShot(void)
 		ret = HWR_Screenshot(va(pandf,pathname,freename));
 	else
 #endif
+	if (vid.bpp == 4)
+	{
+		UINT8 *rgb = M_GetTruecolorScreen();
+		if (rgb)
+		{
+#ifdef USE_PNG
+			ret = M_SavePNG(va(pandf,pathname,freename), rgb, vid.width, vid.height, NULL);
+#else
+			// PCX files need a palette
+			size_t i;
+			linear = screens[2];
+			for (i = 0; i < (size_t)(vid.width * vid.height); i++)
+				linear[i] = NearestColor(rgb[i*3], rgb[i*3 + 1], rgb[i*3 + 2]);
+			M_CreateScreenShotPalette();
+			ret = WritePCXfile(va(pandf,pathname,freename), linear, vid.width, vid.height, screenshot_palette);
+#endif
+			free(rgb);
+		}
+	}
+	else
 	{
 		M_CreateScreenShotPalette();
 #ifdef USE_PNG

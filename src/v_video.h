@@ -187,6 +187,9 @@ void V_DrawFlatFill(INT32 x, INT32 y, INT32 w, INT32 h, lumpnum_t flatnum);
 
 // fade down the screen buffer before drawing the menu over
 void V_DrawFadeScreen(UINT16 color, UINT8 strength);
+
+// how much a row of fadecolormap changes a color by, as a truecolor pixel
+UINT32 V_GetFadeColormapAmount(INT32 row);
 // available to lua over my dead body, which will probably happen in this heat
 void V_DrawFadeFill(INT32 x, INT32 y, INT32 w, INT32 h, INT32 c, UINT16 color, UINT8 strength);
 
