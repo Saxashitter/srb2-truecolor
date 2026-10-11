@@ -635,11 +635,13 @@ static struct {
 	fixed_t fov;        // last field of view given to R_SetFov
 	float sine, cosine; // of the angle the camera is tilted by
 	float horizon;      // the row of the sheared view that is level with the camera
-	INT32 cliptop, clipbottom; // the rows of the sheared view that the band is warped from
+	// The part of the sheared view that the band is warped from, which is all that gets drawn
+	INT32 clipleft, clipright;
+	INT16 cliptop[MAXVIDWIDTH], clipbottom[MAXVIDWIDTH];
 
 	INT32 band, numbands;
 	trueperspectiveband_t bands[TRUEPERSPECTIVE_MAXBANDS + 4];
-} trueperspective = {false, FRACUNIT, FRACUNIT, 0, 0.0f, 1.0f, 0.0f, 0, 0, 0, 1, {{0, 0.0f, 0.0f, 0, 0, 0, 0.0f, 0.0f}}};
+} trueperspective = {false, FRACUNIT, FRACUNIT, 0, 0.0f, 1.0f, 0.0f, 0, 0, {0}, {0}, 0, 1, {{0, 0.0f, 0.0f, 0, 0, 0, 0.0f, 0.0f}}};
 
 // The sheared view can't reach straight up or down however wide it gets.
 // This is as wide as it goes, for the views facing ahead and back.
@@ -874,6 +876,64 @@ void R_CheckViewMorph(void)
 	viewmorph.use = true;
 }
 
+// The warp smooths truecolor pixels between two rows, then along the row.
+// Both are done a row at a time, which is a lot quicker than a pixel at a time.
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+
+// Mixes two rows of pixels. weight is how much of the second row to use, from 0 to 128.
+static void R_MixTruecolorRows(UINT32 *dest, const UINT32 *row1, const UINT32 *row2, INT32 weight, INT32 count)
+{
+	INT32 x = 0;
+
+#ifdef __SSE2__
+	const __m128i zero = _mm_setzero_si128();
+	const __m128i weights = _mm_set1_epi16((short)weight);
+
+	for (; x + 4 <= count; x += 4)
+	{
+		const __m128i pixels1 = _mm_loadu_si128((const __m128i *)(const void *)&row1[x]);
+		const __m128i pixels2 = _mm_loadu_si128((const __m128i *)(const void *)&row2[x]);
+		const __m128i low1 = _mm_unpacklo_epi8(pixels1, zero), high1 = _mm_unpackhi_epi8(pixels1, zero);
+		const __m128i low2 = _mm_unpacklo_epi8(pixels2, zero), high2 = _mm_unpackhi_epi8(pixels2, zero);
+		const __m128i low = _mm_add_epi16(low1, _mm_srai_epi16(_mm_mullo_epi16(_mm_sub_epi16(low2, low1), weights), 7));
+		const __m128i high = _mm_add_epi16(high1, _mm_srai_epi16(_mm_mullo_epi16(_mm_sub_epi16(high2, high1), weights), 7));
+		_mm_storeu_si128((__m128i *)(void *)&dest[x], _mm_packus_epi16(low, high));
+	}
+#endif
+
+	for (; x < count; x++)
+		dest[x] = TC_Mix(row2[x], row1[x], weight * 2);
+}
+
+// Stretches a row of pixels, smoothing between them.
+// src needs a pixel to spare before and after the ones that are used.
+static void R_ScaleTruecolorRow(UINT32 *dest, const UINT32 *src, fixed_t xfrac, fixed_t xstep, INT32 count)
+{
+	INT32 x = 0;
+
+#ifdef __SSE2__
+	const __m128i zero = _mm_setzero_si128();
+
+	for (; x < count; x++, xfrac += xstep)
+	{
+		// both pixels, as 16 bits a channel
+		const __m128i pixels = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(const void *)&src[xfrac >> FRACBITS]), zero);
+		const __m128i next = _mm_srli_si128(pixels, 8);
+		const __m128i weights = _mm_set1_epi16((short)((xfrac >> (FRACBITS - 7)) & 0x7F));
+		const __m128i mixed = _mm_add_epi16(pixels, _mm_srai_epi16(_mm_mullo_epi16(_mm_sub_epi16(next, pixels), weights), 7));
+		dest[x] = (UINT32)_mm_cvtsi128_si32(_mm_packus_epi16(mixed, zero));
+	}
+#else
+	for (; x < count; x++, xfrac += xstep)
+	{
+		const UINT32 *pixels = &src[xfrac >> FRACBITS];
+		dest[x] = TC_Mix(pixels[1], pixels[0], (xfrac >> (FRACBITS - 8)) & 0xFF);
+	}
+#endif
+}
+
 // Warps the ends of the rows that only a view facing left or right can show.
 static void R_ApplyTruePerspectiveSide(void)
 {
@@ -961,23 +1021,32 @@ static void R_ApplyTruePerspective(void)
 		if (vid.bpp == 4)
 		{
 			// Enough colors to smooth it out
+			static UINT32 rowbuffer[MAXVIDWIDTH + 2], fadebuffer[MAXVIDWIDTH];
 			const float filterrow = max(min(srcrow - 0.5f, (float)(viewheight - 1)), 0.0f);
 			const INT32 srcy = min((INT32)filterrow, viewheight - 2);
-			const UINT32 yweight = (UINT32)((filterrow - srcy) * 256.0f);
-			const UINT32 *src1 = (const UINT32 *)(const void *)srcscr + (srcy * vid.width);
-			const UINT32 *src2 = src1 + vid.width;
+			const UINT32 *src = (const UINT32 *)(const void *)srcscr + (srcy * vid.width);
 			UINT32 *dest = (UINT32 *)(void *)tmpscr + (y * vid.width);
+			UINT32 *mixed = &rowbuffer[1];
 
+			R_MixTruecolorRows(mixed, src, src + vid.width, (INT32)((filterrow - srcy) * 128.0f), viewwidth);
+			mixed[-1] = mixed[0];
+			mixed[viewwidth] = mixed[viewwidth - 1];
+
+			// Nothing here goes off the ends of the row, give or take a rounding error.
 			xfrac -= (FRACUNIT/2);
+			if (xstep < 0)
+				xfrac = min(xfrac, ((viewwidth - 1) << FRACBITS) + (FRACUNIT/2));
+			else
+				xfrac = max(xfrac, -(FRACUNIT/2));
 
-			for (x = 0; x < viewwidth; x++, xfrac += xstep)
+			if (fade < 256)
 			{
-				const INT32 x1 = max(min(xfrac >> FRACBITS, viewwidth - 1), 0);
-				const INT32 x2 = min(x1 + 1, viewwidth - 1);
-				const UINT32 xweight = (xfrac >> (FRACBITS - 8)) & 0xFF;
-				const UINT32 pixel = TC_Mix(TC_Mix(src2[x2], src2[x1], xweight), TC_Mix(src1[x2], src1[x1], xweight), yweight);
-				dest[x] = (fade < 256) ? TC_Mix(pixel, dest[x], fade) : pixel;
+				R_ScaleTruecolorRow(fadebuffer, mixed, xfrac, xstep, viewwidth);
+				for (x = 0; x < viewwidth; x++)
+					dest[x] = TC_Mix(fadebuffer[x], dest[x], fade);
 			}
+			else
+				R_ScaleTruecolorRow(dest, mixed, xfrac, xstep, viewwidth);
 		}
 		else
 		{
@@ -1160,9 +1229,14 @@ static void R_SetFov(fixed_t playerfov)
 	INT32 j = viewheight*16;
 	for (INT32 i = 0; i < j; i++)
 	{
-		fixed_t dy = (i - viewheight*8)<<FRACBITS;
-		dy = FixedMul(abs(dy), fovtan);
-		yslopetab[i] = FixedDiv(centerx*FRACUNIT, dy);
+		// FixedDiv(centerx*FRACUNIT, FixedMul(abs(i - viewheight*8)<<FRACBITS, fovtan)),
+		// but this is done every time the field of view changes, and doubles divide a lot quicker.
+		const INT32 rows = abs(i - viewheight*8);
+		const double dy = (double)rows * fovtan;
+		if ((double)centerx * 4.0 >= dy)
+			yslopetab[i] = INT32_MAX;
+		else
+			yslopetab[i] = (fixed_t)(((double)centerx * 4294967296.0) / dy);
 	}
 
 	projection = projectiony = FixedDiv(centerxfrac, fovtan);
@@ -1407,12 +1481,70 @@ fixed_t R_GetAimingShear(void)
 
 	// Put what the band sees in the middle of the sheared view.
 	{
+		const trueperspectiveband_t *band = &trueperspective.bands[trueperspective.band];
+		const float focal = (viewwidth / 2.0f) / FIXED_TO_FLOAT(trueperspective.basefovtan);
 		const float srcfocal = FIXED_TO_FLOAT(projection);
+		const float halfwidth = viewwidth / 2.0f;
 		float shear = srcfocal * (top + bottom) / 2.0f;
+		INT32 x;
+
 		shear = max(min(shear, viewheight * 7.0f), viewheight * -7.0f);
 		trueperspective.horizon = (viewheight / 2.0f) + shear;
-		trueperspective.cliptop = max((INT32)(trueperspective.horizon - (srcfocal * max(top, bottom))) - 2, 0);
-		trueperspective.clipbottom = min((INT32)(trueperspective.horizon - (srcfocal * min(top, bottom))) + 3, viewheight);
+
+		if (band->facing & 1)
+		{
+			// These rows are all about as far ahead as each other, which is
+			// to say they're in a narrow strip down the middle of a side view.
+			const float depth1 = fabsf((focal * trueperspective.cosine) + (band->validtop * trueperspective.sine));
+			const float depth2 = fabsf((focal * trueperspective.cosine) + (band->validbottom * trueperspective.sine));
+			const float strip = ((srcfocal * max(depth1, depth2)) / band->sidenear) + 3.0f;
+			const INT32 cliptop = max((INT32)(trueperspective.horizon - (srcfocal * top)) - 2, 0);
+			const INT32 clipbottom = min((INT32)(trueperspective.horizon - (srcfocal * bottom)) + 3, viewheight);
+
+			trueperspective.clipleft = max((INT32)(halfwidth - strip), 0);
+			trueperspective.clipright = min((INT32)(halfwidth + strip) + 1, viewwidth);
+
+			for (x = 0; x < viewwidth; x++)
+			{
+				trueperspective.cliptop[x] = (INT16)cliptop;
+				trueperspective.clipbottom[x] = (INT16)clipbottom;
+			}
+		}
+		else
+		{
+			// The further away a row is, the less of its width is used. So every column
+			// is used from the nearest row to as far as rows are still wide enough to reach it.
+			float neardepth, fardepth, nearslope, farslope;
+
+			nearslope = R_GetTruePerspectiveSlope(band->validtop, focal, &neardepth);
+			farslope = R_GetTruePerspectiveSlope(band->validbottom, focal, &fardepth);
+
+			if (neardepth > fardepth)
+			{
+				const float swapdepth = neardepth, swapslope = nearslope;
+				neardepth = fardepth, nearslope = farslope;
+				fardepth = swapdepth, farslope = swapslope;
+			}
+
+			trueperspective.clipleft = 0;
+			trueperspective.clipright = viewwidth;
+
+			for (x = 0; x < viewwidth; x++)
+			{
+				const float column = max(fabsf((x + 0.5f) - halfwidth) - 2.0f, 1.0f);
+				// how far along the band rows stop being this wide
+				const float reach = min(max((((srcfocal * halfwidth) / column) - neardepth) / (fardepth - neardepth + 0.001f), 0.0f), 1.0f);
+				// slopes don't go evenly with distance, but one over them does
+				const float reachdepth = neardepth + ((fardepth - neardepth) * reach);
+				const float height = (nearslope * neardepth) + (((farslope * fardepth) - (nearslope * neardepth)) * reach);
+				const float reachrow = trueperspective.horizon - (srcfocal * (height / reachdepth));
+				const float nearrow = trueperspective.horizon - (srcfocal * nearslope);
+
+				trueperspective.cliptop[x] = (INT16)max((INT32)min(nearrow, reachrow) - 3, 0);
+				trueperspective.clipbottom[x] = (INT16)min((INT32)max(nearrow, reachrow) + 4, viewheight);
+			}
+		}
+
 		return (fixed_t)(shear * FRACUNIT);
 	}
 }
@@ -2019,12 +2151,20 @@ static void R_RenderView(player_t *player)
 	}
 	if (trueperspective.use)
 	{
-		// Only the rows that the band is warped from have to be drawn.
+		// Only the part that the band is warped from has to be drawn.
 		INT32 i;
+
+		if (trueperspective.clipleft > 0 || trueperspective.clipright < viewwidth)
+		{
+			portalclipstart = trueperspective.clipleft;
+			portalclipend = trueperspective.clipright;
+			R_PortalClearClipSegs(portalclipstart, portalclipend);
+		}
+
 		for (i = 0; i < viewwidth; i++)
 		{
-			ceilingclip[i] = (INT16)(trueperspective.cliptop - 1);
-			floorclip[i] = (INT16)trueperspective.clipbottom;
+			ceilingclip[i] = (INT16)(trueperspective.cliptop[i] - 1);
+			floorclip[i] = trueperspective.clipbottom[i];
 		}
 	}
 	R_ClearDrawSegs();
