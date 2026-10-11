@@ -1,7 +1,10 @@
 # important
 this was vibecoded cus im testing the capabilities of claude opus 5.5
 huge shoutouts to my friend neonius for giving me his $20 subscription account
-**i do not condone using claude/chatgpt/whatever ai for making things for you. ai should be used as a tool, not as a creator.** this repo is purely an experiment to see what ai can do, but for the love of god **do not let ai do the heavylifting. make your own code, itll probably be way more functional.** if you do struggle on code its okay to ask for ai to help, but once ai makes almost ALL of your code, that code isnt even yours, your vibecoding
+
+**i do not condone using claude/chatgpt/whatever ai for making things for you. ai should be used as a tool, not as a creator.** this repo is purely an experiment to see what ai can do
+
+for the love of god **do not let ai do the heavylifting. make your own code, itll probably be way more functional.** if you do struggle on code its okay to ask for ai to help, but once ai makes almost ALL of your code, that code isnt even yours, your vibecoding
 
 # Sonic Robo Blast 2
 [![latest release](https://badgen.net/github/release/STJr/SRB2/stable)](https://github.com/STJr/SRB2/releases/latest)
