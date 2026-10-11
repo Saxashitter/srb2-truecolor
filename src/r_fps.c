@@ -202,6 +202,10 @@ void R_InterpolateView(fixed_t frac)
 	viewangle = R_LerpAngle(prevview->angle, newview->angle, frac);
 	aimingangle = R_LerpAngle(prevview->aim, newview->aim, frac);
 
+	// Rows that look past straight up or down are rendered facing another way.
+	R_SetupTruePerspective();
+	viewangle += R_GetTruePerspectiveTurn();
+
 	viewsin = FINESINE(viewangle>>ANGLETOFINESHIFT);
 	viewcos = FINECOSINE(viewangle>>ANGLETOFINESHIFT);
 
